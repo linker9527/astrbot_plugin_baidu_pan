@@ -2,8 +2,8 @@ name: astrbot_plugin_baidu_pan
 display_name: 百度网盘分享下载
 author: linker9527
 author_url: https://github.com/linker9527
-description: 百度网盘分享文件自动下载发送，支持 napcat/SnowLuma/QQ官方机器人等多平台
-short_desc: 百度网盘分享下载与发送
+description: 百度网盘分享自动下载发送插件。核心优势：共享会员——一个百度账号登录，全群成员共享高速下载，人人无需开通会员。主推扫码登录（无需密码，不怕风控），不收集、不存储、不传输任何账号密码，源码完全开源可审计。支持 napcat/SnowLuma/QQ官方机器人等多平台
+short_desc: 共享会员：一个账号全群免会员下载，主推扫码登录不盗号
 version: 1.2.0
 repo: https://github.com/linker9527/astrbot_plugin_baidu_pan
 category: 工具
