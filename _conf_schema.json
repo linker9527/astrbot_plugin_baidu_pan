@@ -1,0 +1,90 @@
+{
+  "login_hint": {
+    "type": "string",
+    "description": "登录请看文档",
+    "hint": "推荐使用扫码登录: /pan qrlogin",
+    "options": [
+      "read"
+    ],
+    "labels": [
+      "我知道了"
+    ],
+    "default": "read"
+  },
+  "max_file_size": {
+    "type": "int",
+    "description": "下载大小限制（MB），0=不限制",
+    "hint": "0 表示不限大小。填数字则限制在该大小内（官方模式下硬限200MB）",
+    "default": 0
+  },
+  "send_mode": {
+    "type": "string",
+    "description": "发送模式",
+    "hint": "onebot: napcat/SnowLuma等OneBot框架，大文件走闪传; official: QQ官方API; other: 其他平台，直接发送文件",
+    "options": [
+      "onebot",
+      "official",
+      "other"
+    ],
+    "labels": [
+      "napcat / SnowLuma (OneBot)",
+      "QQ 官方机器人",
+      "其他平台"
+    ],
+    "default": "onebot"
+  },
+  "blacklist": {
+    "type": "string",
+    "description": "用户黑名单（仅QQ）",
+    "hint": "填入QQ号，多个用英文逗号隔开。被拉黑的用户不回复",
+    "default": "",
+    "condition": {
+      "send_mode": "onebot"
+    }
+  },
+  "download_dir": {
+    "type": "string",
+    "description": "文件下载目录",
+    "hint": "留空则使用插件目录下 storage/downloads/",
+    "default": ""
+  },
+  "cloud_save_dir": {
+    "type": "string",
+    "description": "网盘转存目录",
+    "hint": "转存文件在网盘中的保存路径，如 /我的资源/AutoTransfer 。留空则使用默认 /我的资源/AutoTransfer",
+    "default": ""
+  },
+  "auto_delete_cloud": {
+    "type": "bool",
+    "description": "下载后自动删除网盘文件",
+    "hint": "开启后，文件下载到本地并发送后，自动删除网盘中的转存文件以节省空间",
+    "default": true
+  },
+  "local_cleanup_hour": {
+    "type": "int",
+    "description": "每天定时清理本地下载文件（0-23点，-1=关闭）",
+    "hint": "填入小时数（0-23），如填3表示每天凌晨3点清理下载目录中的文件。填-1则不自动清理",
+    "default": 3
+  },
+  "progress_enabled": {
+    "type": "bool",
+    "description": "下载时显示进度和速度",
+    "hint": "开启后，下载过程中会每隔一段时间报告进度百分比和速度",
+    "default": false
+  },
+  "progress_interval": {
+    "type": "int",
+    "description": "进度更新间隔（秒）",
+    "hint": "下载进度报告的间隔时间，单位秒，建议30-60",
+    "default": 30,
+    "condition": {
+      "progress_enabled": true
+    }
+  },
+  "timeout_seconds": {
+    "type": "int",
+    "description": "下载超时时间（秒）",
+    "hint": "-1 表示不超时，会一直等到下载完成。正数表示超时秒数，超时后取消下载",
+    "default": -1
+  }
+}

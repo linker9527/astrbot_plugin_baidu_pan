@@ -1,0 +1,28 @@
+name: astrbot_plugin_baidu_pan
+display_name: 百度网盘分享下载
+author: linker9527
+author_url: https://github.com/linker9527
+description: 百度网盘分享文件自动下载发送，支持 napcat/SnowLuma/QQ官方机器人等多平台
+short_desc: 百度网盘分享下载与发送
+version: 1.2.0
+repo: https://github.com/linker9527/astrbot_plugin_baidu_pan
+category: 工具
+tags:
+  - baidu
+  - 网盘
+  - 下载
+  - qq-bot
+help: |
+  百度网盘分享下载插件 - 自动下载网盘分享文件并通过机器人发送
+
+  命令:
+  /pan <链接或surl> [提取码] - 下载并发送百度网盘分享文件
+  支持完整链接和surl两种格式
+
+  配置:
+  bduuss - 百度网盘登录Cookie BDUSS
+  max_file_size - 最大下载文件大小（MB）
+  send_mode - 发送模式：onebot(napcat) / official(QQ官方) / other(其他平台)
+  progress_interval - 进度推送间隔（秒），默认5
+  download_dir - 文件下载目录（留空用插件目录 storage/downloads/）
+  timeout_seconds - 下载超时时间（秒），-1表示不超时

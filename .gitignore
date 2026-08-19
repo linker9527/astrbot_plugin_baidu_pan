@@ -1,0 +1,6 @@
+core/
+storage/
+__pycache__/
+*.pyc
+test_*.txt
+qr_test.png
