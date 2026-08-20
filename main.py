@@ -1170,8 +1170,11 @@ class BaiduPanPlugin(Star):
         self._cached_tree = ""
         self._cached_items = []
 
-        # 设置 BaiduPCS-Go 下载目录
-        _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
+        # 设置 BaiduPCS-Go 下载目录（exe 可用时才设置）
+        if _ensure_bpcs_exe():
+            _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
+        else:
+            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan download 下载，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
