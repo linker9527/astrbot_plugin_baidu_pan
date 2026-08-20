@@ -191,7 +191,7 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning(f"[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan download 下载")
+            logger.warning(f"[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan help 中提供的命令进行下载或查看readme")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -206,7 +206,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
     if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan download 下载"}
+        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -255,7 +255,7 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
     if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan download 下载"}
+        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
         part.strip() for part in cookie_str.split(";")
@@ -283,7 +283,7 @@ def login_bpcs(username: str, password: str) -> dict:
     """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。"""
     global _bpcs_inited
     if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan download 下载"}
+        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
     out, err, code = _run_bpcs(
         ["login", f"-username={username}", f"-password={password}"], timeout=60
     )
@@ -302,7 +302,7 @@ def logout_bpcs() -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
     if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan download 下载"}
+        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
@@ -1174,7 +1174,7 @@ class BaiduPanPlugin(Star):
         if _ensure_bpcs_exe():
             _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
         else:
-            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan download 下载，配置将在下载后生效")
+            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan help 中提供的命令进行下载或查看readme，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
@@ -1541,7 +1541,7 @@ class BaiduPanPlugin(Star):
 
         # 以下命令都需要 BaiduPCS-Go.exe
         if not _ensure_bpcs_exe():
-            yield event.plain_result("❌ BaiduPCS-Go.exe 缺失或损坏，请使用 /pan download 下载")
+            yield event.plain_result("❌ BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
             return
 
         if parts[0] == "look":
