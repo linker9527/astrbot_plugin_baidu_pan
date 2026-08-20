@@ -1528,6 +1528,12 @@ class BaiduPanPlugin(Star):
             yield event.plain_result("/pan login <账号> <密码>")
             yield event.plain_result("/pan unlogin  退出登录")
             yield event.plain_result("/pan download  下载/更新 BaiduPCS-Go 工具")
+            sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
+            if os.path.exists(sponsor_path):
+                yield event.chain_result([
+                    Plain("支持作者↓↓↓"),
+                    Image.fromFileSystem(sponsor_path)
+                ])
             return
 
         if parts[0] == "download":
