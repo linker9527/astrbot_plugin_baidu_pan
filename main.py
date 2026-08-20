@@ -1531,7 +1531,7 @@ class BaiduPanPlugin(Star):
             sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
             if os.path.exists(sponsor_path):
                 yield event.chain_result([
-                    Plain("支持作者↑"),
+                    Plain("支持作者↑↑↑"),
                     Image.fromFileSystem(sponsor_path)
                 ])
             return
