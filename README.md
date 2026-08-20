@@ -37,7 +37,7 @@ astrbot_plugin_baidu_pan/
 ├── main.py                  # 插件主入口，命令注册 + 下载/转存/查看目录逻辑 (46 KB)
 ├── _conf_schema.json        # 配置项定义
 ├── metadata.yaml            # 插件元信息
-├── BaiduPCS-Go.exe          # 内置百度网盘 CLI 工具 (12.7 MB，启动时校验 SHA256)
+├── BaiduPCS-Go.exe          # 首次使用 /pan download 自动下载（不打包在插件中）
 ├── logo.png                 # 插件图标 (33 KB)
 ├── .gitignore
 └── README.md                # 本文件
@@ -57,37 +57,34 @@ astrbot_plugin_baidu_pan/
 
 ### BaiduPCS-Go
 
-插件内置 BaiduPCS-Go v4.0.1 可执行文件（与 main.py 同目录），无需额外下载。**插件每次启动时会自动校验该 exe 的 SHA256，与官方一致才允许使用，防止使用被篡改的二进制。**
+插件**不内置** BaiduPCS-Go.exe。首次使用时执行 `/pan download`，插件会自动从 GitHub 官方 release 下载。下载 URL 和文件大小均从 GitHub API 实时获取（官方来源），不硬编码哈希值，确保下载的二进制与官方一致。
 
 > ⚠️ **安全声明（必读）**
 >
 > BaiduPCS-Go 是第三方开源命令行工具，源码仓库：https://github.com/qjfoidnh/BaiduPCS-Go
 >
-> **本插件打包的 BaiduPCS-Go.exe 来自上述仓库 v4.0.1 官方 Release（windows-x64）**，未经任何修改。
+> **本插件不打包任何二进制文件。** BaiduPCS-Go.exe 在首次使用 `/pan download` 时从上述仓库 v4.0.1 官方 Release（windows-x64）自动下载。
 >
-> **文件哈希值（用于完整性校验）：**
+> **下载校验机制（代码可审计）：**
 >
-> | 项目 | 值 |
-> |---|---|
-> | 文件名 | BaiduPCS-Go.exe |
-> | 版本 | v4.0.1（windows-x64） |
-> | 大小 | 13,314,048 bytes（12.7 MB） |
-> | SHA256 | `4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41` |
+> 1. 插件通过 GitHub API（`api.github.com/repos/qjfoidnh/BaiduPCS-Go/releases/tags/v4.0.1`）获取官方 release 信息
+> 2. 下载 URL 和文件大小均来自官方 API 返回值，**不硬编码**
+> 3. 下载的 zip 解压后校验大小是否与 API 返回值一致
+> 4. 校验通过才写入本地使用；如文件损坏可用 `/pan download` 重新下载
 >
-> **如何自行核对哈希值：**
+> **如何手动验证下载的文件：**
 >
-> 1. 打开官方 Release 页面：https://github.com/qjfoidnh/BaiduPCS-Go/releases/tag/v4.0.1
+> 1. 官方 Release 页面：https://github.com/qjfoidnh/BaiduPCS-Go/releases/tag/v4.0.1
 > 2. 下载 `BaiduPCS-Go-v4.0.1-windows-x64.zip`，解压得到 `BaiduPCS-Go.exe`
 > 3. 计算本地 exe 的 SHA256：
 >    - Windows PowerShell：`Get-FileHash BaiduPCS-Go.exe -Algorithm SHA256`
 >    - Linux / macOS：`shasum -a 256 BaiduPCS-Go.exe`
-> 4. 对比结果应为：`4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41`
-> 5. 官方 Release 页面每个 zip 旁也直接标注了 sha256，可与上述值交叉核对
+> 4. 官方 Release 页面每个 zip 旁标注了 sha256，可交叉核对
 >
 > 插件源码（main.py）全程不接触、不存储、不传输百度账号密码——`/pan login` 命令只是把账号密码作为命令行参数传给 BaiduPCS-Go 进程，登录完成后密码即从内存中丢弃。
 >
-> 如对内置 exe 仍有疑虑：
-> 1. 可从 [官方 Release](https://github.com/qjfoidnh/BaiduPCS-Go/releases) 重新下载替换，按上方步骤校验 SHA256 一致后使用
+> 如对 exe 仍有疑虑：
+> 1. 可自行从 [官方 Release](https://github.com/qjfoidnh/BaiduPCS-Go/releases) 下载，按上方步骤核对后替换插件目录下的 exe
 > 2. 有条件的用户建议**自行从源码编译**（`go build`），替换插件目录下的 exe
 > 3. 插件不接触、不存储、不传输任何账号密码，可自行审计源码
 
