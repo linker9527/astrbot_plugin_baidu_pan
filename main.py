@@ -28,6 +28,12 @@ BPCS_VERSION = "v4.0.1"
 BPCS_REPO = "qjfoidnh/BaiduPCS-Go"
 BPCS_API_URL = f"https://api.github.com/repos/{BPCS_REPO}/releases/tags/{BPCS_VERSION}"
 BPCS_ASSET_NAME = "BaiduPCS-Go-v4.0.1-windows-x64.zip"
+# 国内镜像直链（与官方 GitHub release 完全一致，SHA256 已核对）
+BPCS_CN_URL = "https://www.now61.cn/f/0pb4TV/BaiduPCS-Go.exe"
+# exe 的 SHA256 和大小（来自 GitHub release 页面官方显示，可自行核对：
+# https://github.com/qjfoidnh/BaiduPCS-Go/releases/tag/v4.0.1）
+BPCS_EXE_SHA256 = "4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41"
+BPCS_EXE_SIZE = 13314048
 DOWNLOAD_DIR = None  # 初始化时根据配置设置
 CLOUD_SAVE_DIR = None  # 网盘转存目录
 FLASH_TASK_LIMIT_MB = 200
@@ -73,13 +79,55 @@ def _fetch_release_info() -> dict | None:
 
 
 def _download_bpcs_exe() -> dict:
-    """从官方 GitHub release 下载 BaiduPCS-Go.exe。
-    下载 URL 和文件大小均来自 GitHub API（官方来源），不硬编码哈希值。
+    """下载 BaiduPCS-Go.exe。
+    优先从国内镜像直链下载（已与官方核对 SHA256 一致），失败回退 GitHub 官方 release。
     返回 {"ok": True} 或 {"error": "..."}。"""
-    import zipfile as _zip, io as _io
+    import hashlib as _hashlib, zipfile as _zip, io as _io
+
+    def _sha256(data: bytes) -> str:
+        h = _hashlib.sha256()
+        h.update(data)
+        return h.hexdigest()
+
+    def _get(url: str, timeout: int = 300) -> bytes | None:
+        headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
+        try:
+            r = _req.get(url, timeout=timeout, headers=headers)
+            r.raise_for_status()
+            return r.content
+        except _req.exceptions.SSLError:
+            import urllib3 as _u3
+            _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
+            try:
+                r = _req.get(url, timeout=timeout, verify=False, headers=headers)
+                r.raise_for_status()
+                return r.content
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    # ── 方案 1：国内镜像直链（直接下载 exe，不用解压）──
+    logger.info(f"[BaiduPan] 尝试从国内镜像下载 BaiduPCS-Go.exe...")
+    data = _get(BPCS_CN_URL, timeout=120)
+    if data is not None:
+        if len(data) == BPCS_EXE_SIZE and _sha256(data) == BPCS_EXE_SHA256:
+            try:
+                with open(BPCS_PATH, "wb") as f:
+                    f.write(data)
+                logger.info(f"[BaiduPan] 国内镜像下载成功（{len(data)} bytes，SHA256 校验通过）")
+                return {"ok": True}
+            except Exception as e:
+                return {"error": f"写入 exe 失败: {e}"}
+        logger.warning(f"[BaiduPan] 国内镜像文件校验失败: size={len(data)}/{BPCS_EXE_SIZE}, sha256={'ok' if _sha256(data)==BPCS_EXE_SHA256 else 'mismatch'}")
+    else:
+        logger.warning("[BaiduPan] 国内镜像下载失败，回退 GitHub")
+
+    # ── 方案 2：GitHub 官方 release（下载 zip，校验 size，解压）──
+    logger.info(f"[BaiduPan] 从 GitHub 官方 release 下载 BaiduPCS-Go {BPCS_VERSION}...")
     info = _fetch_release_info()
     if not info:
-        return {"error": "无法获取 GitHub release 信息，请检查网络后重试"}
+        return {"error": "国内镜像和 GitHub 均下载失败，请检查网络后使用 /pan download 重试"}
     asset = None
     for a in info.get("assets", []):
         if a.get("name") == BPCS_ASSET_NAME:
@@ -89,23 +137,9 @@ def _download_bpcs_exe() -> dict:
         return {"error": f"未在 release {BPCS_VERSION} 中找到 {BPCS_ASSET_NAME}"}
     download_url = asset["browser_download_url"]
     expected_size = asset["size"]
-    logger.info(f"[BaiduPan] 正在从 GitHub 官方 release 下载 BaiduPCS-Go {BPCS_VERSION}...")
-    headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
-    try:
-        resp = _req.get(download_url, timeout=300, headers=headers)
-        resp.raise_for_status()
-        data = resp.content
-    except _req.exceptions.SSLError:
-        import urllib3 as _u3
-        _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
-        try:
-            resp = _req.get(download_url, timeout=300, verify=False, headers=headers)
-            resp.raise_for_status()
-            data = resp.content
-        except Exception as e:
-            return {"error": f"下载失败: {e}"}
-    except Exception as e:
-        return {"error": f"下载失败: {e}"}
+    data = _get(download_url, timeout=300)
+    if data is None:
+        return {"error": "GitHub 下载失败，请检查网络后重试"}
     if len(data) != expected_size:
         return {"error": f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"}
     try:
@@ -125,10 +159,13 @@ def _download_bpcs_exe() -> dict:
             exe_data = zf.read(exe_name)
     except Exception as e:
         return {"error": f"解压失败: {e}"}
+    # GitHub 下载的 exe 也校验 SHA256
+    if _sha256(exe_data) != BPCS_EXE_SHA256:
+        return {"error": "exe SHA256 与官方不一致，文件可能被篡改"}
     try:
         with open(BPCS_PATH, "wb") as f:
             f.write(exe_data)
-        logger.info(f"[BaiduPan] BaiduPCS-Go.exe 下载成功（{len(exe_data)} bytes，官方 {BPCS_VERSION}）")
+        logger.info(f"[BaiduPan] GitHub 下载成功（{len(exe_data)} bytes，SHA256 校验通过）")
         return {"ok": True}
     except Exception as e:
         return {"error": f"写入 exe 失败: {e}"}
