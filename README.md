@@ -37,7 +37,7 @@ astrbot_plugin_baidu_pan/
 ├── main.py                  # 插件主入口，命令注册 + 下载/转存/查看目录逻辑 (46 KB)
 ├── _conf_schema.json        # 配置项定义
 ├── metadata.yaml            # 插件元信息
-├── BaiduPCS-Go.exe          # 内置百度网盘 CLI 工具 (12.7 MB)
+├── BaiduPCS-Go.exe          # 内置百度网盘 CLI 工具 (12.7 MB，启动时校验 SHA256)
 ├── logo.png                 # 插件图标 (33 KB)
 ├── .gitignore
 └── README.md                # 本文件
@@ -57,19 +57,39 @@ astrbot_plugin_baidu_pan/
 
 ### BaiduPCS-Go
 
-插件已内置 BaiduPCS-Go v4.0.1 可执行文件（与 main.py 同目录），无需额外下载。
+插件内置 BaiduPCS-Go v4.0.1 可执行文件（与 main.py 同目录），无需额外下载。**插件每次启动时会自动校验该 exe 的 SHA256，与官方一致才允许使用，防止使用被篡改的二进制。**
 
 > ⚠️ **安全声明（必读）**
 >
-> BaiduPCS-Go 是第三方开源命令行工具，源码仓库：https://github.com/liutianhou/BaiduPCS-Go
+> BaiduPCS-Go 是第三方开源命令行工具，源码仓库：https://github.com/qjfoidnh/BaiduPCS-Go
 >
-> **本插件打包的 BaiduPCS-Go.exe 来自上述仓库的官方 Release**，未经任何修改。
+> **本插件打包的 BaiduPCS-Go.exe 来自上述仓库 v4.0.1 官方 Release（windows-x64）**，未经任何修改。
+>
+> **文件哈希值（用于完整性校验）：**
+>
+> | 项目 | 值 |
+> |---|---|
+> | 文件名 | BaiduPCS-Go.exe |
+> | 版本 | v4.0.1（windows-x64） |
+> | 大小 | 13,314,048 bytes（12.7 MB） |
+> | SHA256 | `4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41` |
+>
+> **如何自行核对哈希值：**
+>
+> 1. 打开官方 Release 页面：https://github.com/qjfoidnh/BaiduPCS-Go/releases/tag/v4.0.1
+> 2. 下载 `BaiduPCS-Go-v4.0.1-windows-x64.zip`，解压得到 `BaiduPCS-Go.exe`
+> 3. 计算本地 exe 的 SHA256：
+>    - Windows PowerShell：`Get-FileHash BaiduPCS-Go.exe -Algorithm SHA256`
+>    - Linux / macOS：`shasum -a 256 BaiduPCS-Go.exe`
+> 4. 对比结果应为：`4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41`
+> 5. 官方 Release 页面每个 zip 旁也直接标注了 sha256，可与上述值交叉核对
+>
 > 插件源码（main.py）全程不接触、不存储、不传输百度账号密码——`/pan login` 命令只是把账号密码作为命令行参数传给 BaiduPCS-Go 进程，登录完成后密码即从内存中丢弃。
 >
-> 为防止恶意篡改，建议：
-> 1. 如对内置 exe 有疑虑，可从 [官方 Release](https://github.com/liutianhou/BaiduPCS-Go/releases) 重新下载替换，校验 SHA256 一致后使用
+> 如对内置 exe 仍有疑虑：
+> 1. 可从 [官方 Release](https://github.com/qjfoidnh/BaiduPCS-Go/releases) 重新下载替换，按上方步骤校验 SHA256 一致后使用
 > 2. 有条件的用户建议**自行从源码编译**（`go build`），替换插件目录下的 exe
-> 3. 如对安全性有疑虑，可自行审计源码或从源码编译，插件不接触、不存储、不传输任何账号密码
+> 3. 插件不接触、不存储、不传输任何账号密码，可自行审计源码
 
 ### 登录百度网盘
 

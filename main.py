@@ -23,6 +23,9 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.core.star.filter.command import GreedyStr
 
 BPCS_PATH = os.path.join(os.path.dirname(__file__), "BaiduPCS-Go.exe")
+# BaiduPCS-Go 官方 release 信息（用于 SHA256 校验，确保用户放置的二进制与上游一致）
+BPCS_VERSION = "v4.0.1"
+BPCS_EXPECTED_SHA256 = "4719f6ebf7f7891284c9f53a6cc4e9474f872b444fddc05b60ad07147a96cd41"
 DOWNLOAD_DIR = None  # 初始化时根据配置设置
 CLOUD_SAVE_DIR = None  # 网盘转存目录
 FLASH_TASK_LIMIT_MB = 200
@@ -32,6 +35,40 @@ _bpcs_inited = False
 _bpcs_lock = threading.Lock()
 _auto_delete_cloud = True
 _local_cleanup_hour = 3
+
+
+def _verify_bpcs_sha256() -> bool:
+    """校验本地 BaiduPCS-Go.exe 的 SHA256 是否匹配官方 release。"""
+    if not os.path.exists(BPCS_PATH):
+        return False
+    import hashlib as _hashlib
+    h = _hashlib.sha256()
+    try:
+        with open(BPCS_PATH, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except Exception as e:
+        logger.error(f"[BaiduPan] 读取 exe 失败: {e}")
+        return False
+    actual = h.hexdigest()
+    if actual == BPCS_EXPECTED_SHA256:
+        logger.info(f"[BaiduPan] BaiduPCS-Go.exe SHA256 校验通过（官方 {BPCS_VERSION}）")
+        return True
+    logger.error(f"[BaiduPan] BaiduPCS-Go.exe SHA256 不匹配: expected={BPCS_EXPECTED_SHA256}, actual={actual}")
+    return False
+
+
+def _ensure_bpcs_exe() -> bool:
+    """确保 BaiduPCS-Go.exe 存在且 SHA256 校验通过。
+    本插件不内置、不自动下载该 exe：用户需按 README 指引从官方 release 自行下载放入插件目录，
+    插件启动时会校验其 SHA256 是否与官方一致，防止使用被篡改的二进制。"""
+    if not os.path.exists(BPCS_PATH):
+        logger.error(f"[BaiduPan] 未找到 BaiduPCS-Go.exe，请按 README 指引从官方 release 下载官方 {BPCS_VERSION} 版本放入插件目录，并核对 SHA256")
+        return False
+    if _verify_bpcs_sha256():
+        return True
+    logger.error(f"[BaiduPan] BaiduPCS-Go.exe SHA256 与官方不一致，请从官方 release 重新下载替换")
+    return False
 
 
 def _run_bpcs(args: list, timeout: int = 300) -> tuple:
@@ -53,8 +90,8 @@ def _init_bpcs() -> bool:
     with _bpcs_lock:
         if _bpcs_inited:
             return True
-        if not os.path.exists(BPCS_PATH):
-            logger.error(f"[BaiduPan] exe not found: {BPCS_PATH}")
+        if not _ensure_bpcs_exe():
+            logger.error(f"[BaiduPan] BaiduPCS-Go.exe 不可用: {BPCS_PATH}")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -68,8 +105,8 @@ def _init_bpcs() -> bool:
 def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
-    if not os.path.exists(BPCS_PATH):
-        return {"error": f"BaiduPCS-Go 不存在: {BPCS_PATH}"}
+    if not _ensure_bpcs_exe():
+        return {"error": "BaiduPCS-Go.exe 缺失或 SHA256 校验失败，请检查网络后重试"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -117,8 +154,8 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
 def login_cookies_bpcs(cookie_str: str) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
-    if not os.path.exists(BPCS_PATH):
-        return {"error": f"BaiduPCS-Go 不存在: {BPCS_PATH}"}
+    if not _ensure_bpcs_exe():
+        return {"error": "BaiduPCS-Go.exe 缺失或 SHA256 校验失败，请检查网络后重试"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
         part.strip() for part in cookie_str.split(";")
@@ -145,8 +182,8 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
 def login_bpcs(username: str, password: str) -> dict:
     """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。"""
     global _bpcs_inited
-    if not os.path.exists(BPCS_PATH):
-        return {"error": f"BaiduPCS-Go 不存在: {BPCS_PATH}"}
+    if not _ensure_bpcs_exe():
+        return {"error": "BaiduPCS-Go.exe 缺失或 SHA256 校验失败，请检查网络后重试"}
     out, err, code = _run_bpcs(
         ["login", f"-username={username}", f"-password={password}"], timeout=60
     )
@@ -164,8 +201,8 @@ def login_bpcs(username: str, password: str) -> dict:
 def logout_bpcs() -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
-    if not os.path.exists(BPCS_PATH):
-        return {"error": f"BaiduPCS-Go 不存在: {BPCS_PATH}"}
+    if not _ensure_bpcs_exe():
+        return {"error": "BaiduPCS-Go.exe 缺失或 SHA256 校验失败，请检查网络后重试"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
