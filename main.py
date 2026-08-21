@@ -1568,6 +1568,7 @@ class BaiduPanPlugin(Star):
             yield event.plain_result("/pan login <账号> <密码>")
             yield event.plain_result("/pan unlogin  退出登录")
             yield event.plain_result("/pan download  下载/更新 BaiduPCS-Go 工具")
+            yield event.plain_result("/pan download git  强制从 GitHub 下载（出问题时用）")
             sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
             if os.path.exists(sponsor_path):
                 yield event.chain_result([
@@ -1577,6 +1578,15 @@ class BaiduPanPlugin(Star):
             return
 
         if parts[0] == "download":
+            if len(parts) > 1 and parts[1] == "git":
+                # 强制使用 GitHub 下载
+                yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载 BaiduPCS-Go...")
+                result = await asyncio.to_thread(_download_github_exe)
+                if "ok" in result:
+                    yield event.plain_result("✅ BaiduPCS-Go.exe 下载成功！现在可以使用 /pan login 等命令了。")
+                else:
+                    yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
+                return
             # 第一步：国内加速下载
             yield event.plain_result("⏳ 正在使用国内加速下载 BaiduPCS-Go...")
             result = await asyncio.to_thread(_download_cn_exe)

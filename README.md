@@ -59,6 +59,8 @@ astrbot_plugin_baidu_pan/
 
 插件**不内置** BaiduPCS-Go.exe。首次使用时执行 `/pan download`，插件会自动下载并校验。下载策略：**优先从国内镜像下载**（速度快），失败时自动回退 GitHub 官方 release。
 
+> ⚠️ 国内镜像为第三方提供的 CDN 直链，可能随时失效。如果 `/pan download` 提示"国内下载失败"但没有自动切换到 GitHub，可以使用 `/pan download git` 强制从 GitHub 官方 release 下载。
+
 > ⚠️ **安全声明（必读）**
 >
 > BaiduPCS-Go 是第三方开源命令行工具，源码仓库：https://github.com/qjfoidnh/BaiduPCS-Go
@@ -71,6 +73,7 @@ astrbot_plugin_baidu_pan/
 > 2. **回退 GitHub**：国内镜像失败时，通过 GitHub API 获取官方 release 信息，下载 zip 并校验大小（来自 API）
 > 3. **双重校验**：无论哪个来源，下载后都校验 SHA256 和文件大小
 > 4. 校验通过才写入本地使用；如文件损坏可用 `/pan download` 重新下载
+> 5. **强制 GitHub 下载**：如国内镜像失效且未自动回退，可使用 `/pan download git` 跳过国内镜像，直接从 GitHub 官方 release 下载
 >
 > **SHA256 值（来自 GitHub release 页面官方显示，可自行核对）：**
 >
