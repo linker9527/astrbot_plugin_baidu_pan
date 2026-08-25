@@ -1193,7 +1193,12 @@ class BaiduPanPlugin(Star):
             DOWNLOAD_DIR = os.path.abspath(custom_dir)
         else:
             DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "storage", "downloads")
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        try:
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[BaiduPan] 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
+            DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "storage", "downloads")
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         logger.info(f"[BaiduPan] download dir: {DOWNLOAD_DIR}")
 
         global CLOUD_SAVE_DIR
