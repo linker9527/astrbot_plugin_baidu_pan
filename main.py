@@ -456,8 +456,110 @@ def _grab_share_field(html: str, key: str) -> str:
     return m.group(1) if m else ""
 
 
-def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
-    """用 Python requests 直接调用百度网盘 API 转存分享链接到指定目录。
+def _get_bdstoken(sess) -> str:
+    """通过轻量接口获取 bdstoken（不依赖 /s/ 分享页渲染，分享页故障时仍可用）。"""
+    try:
+        r = sess.get(
+            "https://pan.baidu.com/api/gettemplatevariable",
+            params={"app_id": "250528", "web": "1", "clienttype": "0",
+                    "fields": '["bdstoken"]'},
+            timeout=15, headers={"Referer": "https://pan.baidu.com/disk/main"})
+        j = r.json()
+        if j.get("errno") == 0:
+            return (j.get("result") or {}).get("bdstoken", "")
+    except Exception as e:
+        logger.warning(f"[BaiduPan] gettemplatevariable 失败: {e}")
+    return ""
+
+
+def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
+    """兜底：从 /s/ 分享页 HTML 解析 shareid / uk / bdstoken。
+    仅在 shorturlinfo 网络层失败时使用（分享页服务故障时此路很慢）。"""
+    r = None
+    for _attempt in (1, 2):
+        try:
+            r = sess.get(share_link, timeout=30,
+                         headers={"Referer": "https://pan.baidu.com/disk/home"})
+            break
+        except _req.exceptions.RequestException as e:
+            if _attempt == 2:
+                if isinstance(e, _req.exceptions.ReadTimeout):
+                    # 正常分享页 1s 左右响应；两次都读超时基本是分享已在服务端失效
+                    return {"error": "分享页无响应（重试仍超时），该分享链接很可能已失效，请让分享者重新分享"}
+                raise
+            logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
+            time.sleep(1)
+    if _grab_share_field(r.text, "loginstate") == "0":
+        return {"error": "网盘未登录，请使用 /pan qrlogin 重新登录"}
+    info = {
+        "shareid": _grab_share_field(r.text, "shareid"),
+        "share_uk": _grab_share_field(r.text, "share_uk") or _grab_share_field(r.text, "uk"),
+        "bdstoken": _grab_share_field(r.text, "bdstoken"),
+    }
+    if not info["shareid"]:
+        return {"error": "无法获取分享信息，链接可能已失效"}
+    return info
+
+
+def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
+    """转存/列目录的公共前置：shorturlinfo 拿 shareid/uk → gettemplatevariable
+    拿 bdstoken → 需要时验证提取码。全程不依赖 /s/ 分享页渲染。
+    返回 {"shareid","uk","bdstoken","short"} 或 {"error"}。"""
+    shareid = share_uk = bdstoken = ""
+    need_pwd = False
+    try:
+        r1 = sess.get(
+            "https://pan.baidu.com/api/shorturlinfo",
+            params={"appid": "250528", "shorturl": surl, "root": "1"},
+            timeout=15, headers={"Referer": "https://pan.baidu.com/disk/main"})
+        j1 = r1.json()
+        shareid = str(j1.get("shareid") or "")
+        share_uk = str(j1.get("uk") or "")
+        need_pwd = (j1.get("errno") == -9)
+        if not shareid:
+            show = j1.get("show_msg") or j1.get("err_msg") or f"errno={j1.get('errno')}"
+            return {"error": f"分享链接无效或已失效（{show}）"}
+    except (_req.exceptions.RequestException, ValueError) as e:
+        # 仅网络层失败才回退分享页解析（接口明确返回 errno 时链接就是无效的）
+        logger.warning(f"[BaiduPan] shorturlinfo 请求失败，回退分享页解析: {e}")
+        page = _resolve_share_via_page(sess, surl, share_link)
+        if "error" in page:
+            return page
+        shareid = page["shareid"]
+        share_uk = page["share_uk"]
+        bdstoken = page["bdstoken"]
+    if not bdstoken:
+        bdstoken = _get_bdstoken(sess)
+    if not bdstoken:
+        return {"error": "无法获取 bdstoken，请稍后重试或重新登录"}
+    if pwd or need_pwd:
+        if not pwd:
+            return {"error": "该分享需要提取码，请按「链接 提取码」的格式发送"}
+        verify_url = (
+            f"https://pan.baidu.com/share/verify"
+            f"?shareid={shareid}&time={int(time.time()*1000)}"
+            f"&clienttype=1&uk={share_uk}"
+        )
+        headers = {
+            "Referer": share_link,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        r2 = sess.post(verify_url, data={
+            "pwd": pwd, "vcode": "null", "vcode_str": "null", "bdstoken": bdstoken
+        }, headers=headers, timeout=20)
+        resp2 = r2.json()
+        if resp2.get("errno") != 0:
+            if resp2.get("errno") == -9:
+                return {"error": "提取码错误"}
+            show = resp2.get("show_msg") or resp2.get("errno")
+            return {"error": f"密码验证失败: {show}"}
+    return {"shareid": shareid, "uk": share_uk, "bdstoken": bdstoken,
+            "short": surl[1:] if surl.startswith("1") else surl}
+
+
+def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None) -> dict:
+    """用 Python requests 直接调用百度网盘 API，把指定的 fs_id 列表转存到 target_path。
+    fs_ids 为 None 时转存分享根目录的全部文件。
     替代 BaiduPCS-Go 的 transfer 命令（v4.0.1 有 cookie 传递 bug）。
 
     返回: {"success": True, "filenames": [...], "fs_ids": [...]}
@@ -470,74 +572,33 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
     share_link = f"https://pan.baidu.com/s/{surl}"
 
     try:
-        # Step 1: 访问分享页，获取 bdstoken / share_uk / shareid
-        # 分享页较重且百度风控会拖响应，超时放宽到 30s 并重试一次
-        r = None
-        for _attempt in (1, 2):
-            try:
-                r = sess.get(share_link, timeout=30,
-                             headers={"Referer": "https://pan.baidu.com/disk/home"})
-                break
-            except _req.exceptions.RequestException as e:
-                if _attempt == 2:
-                    if isinstance(e, _req.exceptions.ReadTimeout):
-                        # 正常分享页 1s 左右响应；两次都读超时基本是分享已在
-                        # 服务端失效（失效分享百度会挂 ~50s 才返回 500）
-                        return {"error": "分享页无响应（重试仍超时），该分享链接很可能已失效，请让分享者重新分享"}
-                    raise
-                logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
-                time.sleep(1)
-        if _grab_share_field(r.text, "loginstate") == "0":
-            return {"error": "网盘未登录，请使用 /pan qrlogin 重新登录"}
-        bdstoken = _grab_share_field(r.text, "bdstoken")
-        share_uk = _grab_share_field(r.text, "share_uk") or _grab_share_field(r.text, "uk")
-        shareid = _grab_share_field(r.text, "shareid")
-        if not bdstoken or not shareid:
-            return {"error": "无法获取分享信息，链接可能已失效"}
-        logger.info(f"[BaiduPan] transfer: shareid={shareid}, bdstoken={bdstoken[:16]}...")
+        pf = _share_api_preflight(sess, surl, pwd, share_link)
+        if "error" in pf:
+            return pf
+        shareid, share_uk = pf["shareid"], pf["uk"]
+        bdstoken, short = pf["bdstoken"], pf["short"]
+        logger.info(f"[BaiduPan] transfer: shareid={shareid}, uk={share_uk}, fs_ids={fs_ids or '全部'}")
 
-        # Step 2: 验证密码（如果有）
-        if pwd:
-            verify_url = (
-                f"https://pan.baidu.com/share/verify"
-                f"?shareid={shareid}&time={int(time.time()*1000)}"
-                f"&clienttype=1&uk={share_uk}"
-            )
-            headers = {
-                "Referer": share_link,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            }
-            r2 = sess.post(verify_url, data={
-                "pwd": pwd, "vcode": "null", "vcode_str": "null", "bdstoken": bdstoken
-            }, headers=headers, timeout=20)
-            resp2 = r2.json()
-            if resp2.get("errno") != 0:
-                if resp2.get("errno") == -9:
-                    return {"error": "提取码错误"}
-                return {"error": f"密码验证失败: {resp2.get('errno')}"}
-
-        # Step 3: 重新访问分享页（带 init referer），获取新 bdstoken
-        r3 = sess.get(share_link, timeout=30,
-                      headers={"Referer": f"https://pan.baidu.com/share/init?surl={surl}"})
-        bdstoken = _grab_share_field(r3.text, "bdstoken") or bdstoken
-
-        # Step 4: 获取文件列表（短链一般以 1 开头，list 接口要求去掉）
-        short = surl[1:] if surl.startswith("1") else surl
-        list_url = (
-            f"https://pan.baidu.com/share/list"
-            f"?bdstoken={bdstoken}&root=1&web=5&app_id=250528"
-            f"&shorturl={short}&channel=chunlei&clienttype=0"
-        )
-        r4 = sess.get(list_url, timeout=30, headers={"Referer": share_link})
-        resp4 = r4.json()
-        if resp4.get("errno") != 0:
-            return {"error": f"获取文件列表失败: {resp4.get('errno')}"}
-        files = resp4.get("list", [])
-        if not files:
-            return {"error": "分享链接中没有文件"}
-        fs_ids = [str(f.get("fs_id")) for f in files]
-        filenames = [f.get("server_filename") for f in files]
-        logger.info(f"[BaiduPan] transfer files: {filenames}")
+        filenames = []
+        if not fs_ids:
+            # 未指定 fs_id：列出分享根目录全部文件
+            rl = sess.get(
+                "https://pan.baidu.com/share/list",
+                params={"bdstoken": bdstoken, "root": "1", "web": "5", "app_id": "250528",
+                        "shorturl": short, "channel": "chunlei", "clienttype": "0"},
+                headers={"Referer": share_link}, timeout=30)
+            resp4 = rl.json()
+            if resp4.get("errno") != 0:
+                if resp4.get("errno") == -9:
+                    return {"error": "该分享需要提取码，请按「链接 提取码」的格式发送"}
+                show = resp4.get("show_msg") or resp4.get("errno")
+                return {"error": f"获取文件列表失败: {show}"}
+            files = resp4.get("list", [])
+            if not files:
+                return {"error": "分享链接中没有文件"}
+            fs_ids = [str(f.get("fs_id")) for f in files if f.get("fs_id")]
+            filenames = [f.get("server_filename") for f in files]
+            logger.info(f"[BaiduPan] transfer files: {filenames}")
 
         # Step 5: 执行转存
         transfer_url = (
@@ -566,15 +627,18 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
             logger.info(f"[BaiduPan] transfer errno={errno} (already exists), filenames={filenames}")
             return {"success": True, "filenames": filenames, "fs_ids": fs_ids, "_own_share": own}
         elif errno == 12:
-            # 文件冲突，检查具体错误
-            info = resp5.get("info", [])
-            conflict_msg = "文件冲突"
-            if info:
-                for item in info:
-                    e = item.get("errno", 0)
-                    if e == -30:
-                        conflict_msg = "目标目录下已有同名文件"
-            return {"error": f"转存失败: {conflict_msg}"}
+            # 按 info 里的具体 errno 区分：-30 同名已存在 / -32 空间不足
+            info = resp5.get("info", []) or []
+            errnos = [item.get("errno") for item in info]
+            if errnos and all(e in (-30, 0) for e in errnos):
+                # 目标目录已有同名文件（多为之前已转存过），文件已在云端即可继续
+                logger.info(f"[BaiduPan] transfer errno=12 (same-name exists), filenames={filenames}")
+                return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
+            if -32 in errnos or "空间不足" in (resp5.get("show_msg") or ""):
+                need_gb = (resp5.get("target_size") or 0) / 1024 ** 3
+                return {"error": f"网盘剩余空间不足，无法转存（本次约需 {need_gb:.0f} GB）。"
+                                 f"请只选择需要的文件/文件夹下载（/pan file <路径>）"}
+            return {"error": f"转存失败: {resp5.get('show_msg') or '文件冲突'}"}
         else:
             show_msg = resp5.get("show_msg", "") or resp5.get("err_msg", "")
             return {"error": f"转存失败(errno={errno}): {show_msg}"}
@@ -729,74 +793,73 @@ def _parse_ls_line(line: str):
     return name, size_raw, is_dir
 
 
-def list_share_content(surl: str, pwd: str = "") -> dict:
-    """转存分享链接并列出目录结构，返回格式化后的文本和文件列表。"""
-    cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-    result = _transfer_via_api(surl, pwd, cloud_dir)
-    if "error" in result:
-        return {"error": result["error"]}
+def _list_share_tree_api(surl: str, pwd: str) -> dict:
+    """通过 share/list API 直接列出分享目录树（不转存、不依赖 /s/ 分享页）。
+    只读目录结构，不占网盘空间，特大分享（TB 级）也能正常浏览。
+    返回 {"text": 目录树文本, "items": [{path,name,size,is_dir,fs_id}]} 或 {"error"}。"""
+    sess = _build_pan_session()
+    if sess is None:
+        return {"error": "无法获取百度网盘登录凭证，请先使用 /pan qrlogin 登录"}
+    share_link = f"https://pan.baidu.com/s/{surl}"
+    pf = _share_api_preflight(sess, surl, pwd, share_link)
+    if "error" in pf:
+        return pf
+    bdstoken, short = pf["bdstoken"], pf["short"]
 
-    own_share = result.get("_own_share", False)
-    filenames = result.get("filenames", [])
+    lines, items = [], []
+    state = {"truncated": False}
 
-    lines = []
-    all_items = []  # [(path, name, size, is_dir)]
-
-    if own_share:
-        lines.append("⚠️ 这是你自己的分享链接，API 无法重复转存")
-        lines.append(f"   分享中的文件: {', '.join(filenames)}")
-        lines.append("   如需下载，请直接从网盘原目录操作")
-        return {"text": "\n".join(lines), "items": [], "own_share": True}
-
-    # 递归列出目录内容
-    def _list_dir(dir_path: str, indent: int = 0):
-        if indent > 10:  # 防御过深的目录嵌套
+    def _walk(dir_rel: str, depth: int):
+        if len(items) > 300:
+            state["truncated"] = True
             return
-        out, _, code = _run_bpcs(["ls", "-l", dir_path], timeout=60)
-        if code != 0:
+        if depth > 2:  # 最多展示 3 层，更深的用 /pan file <路径> 按需下载
             return
-        prefix = "  " * indent
-        for line in out.split("\n"):
-            parsed = _parse_ls_line(line)
-            if not parsed:
+        params = {"bdstoken": bdstoken, "web": "5", "app_id": "250528",
+                  "shorturl": short, "channel": "chunlei", "clienttype": "0", "num": "100"}
+        if dir_rel:
+            params["dir"] = "/" + dir_rel
+            params["root"] = "0"
+        else:
+            params["root"] = "1"
+        try:
+            r = sess.get("https://pan.baidu.com/share/list", params=params,
+                         headers={"Referer": share_link}, timeout=30)
+            lst = r.json().get("list", [])
+        except Exception as e:
+            logger.warning(f"[BaiduPan] share/list {dir_rel or '根目录'} 失败: {e}")
+            return
+        prefix = "  " * depth
+        for f in lst[:60]:
+            name = f.get("server_filename") or ""
+            if not name:
                 continue
-            name, size_raw, is_dir = parsed
+            is_dir = str(f.get("isdir")) == "1"
+            rel = f"{dir_rel}/{name}" if dir_rel else name
             if is_dir:
                 lines.append(f"{prefix}📁 {name}/")
-                all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": "-", "is_dir": True})
-                _list_dir(f"{dir_path}/{name}", indent + 1)
+                items.append({"path": rel, "name": name, "size": "-", "is_dir": True,
+                              "fs_id": str(f.get("fs_id"))})
+                _walk(rel, depth + 1)
             else:
-                lines.append(f"{prefix}📄 {name}  ({_format_size(size_raw)})")
-                all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": size_raw, "is_dir": False})
+                lines.append(f"{prefix}📄 {name}  ({_format_size(str(f.get('size', 0)))})")
+                items.append({"path": rel, "name": name, "size": str(f.get("size", 0)),
+                              "is_dir": False, "fs_id": str(f.get("fs_id"))})
 
-    # 获取顶层目录内容，不展示顶层目录名，子目录各自成树，空行分隔
-    out, _, code = _run_bpcs(["ls", "-l", cloud_dir], timeout=60)
-    if code != 0:
-        return {"error": "获取目录列表失败"}
-
-    top_items = []
-    for line in out.split("\n"):
-        parsed = _parse_ls_line(line)
-        if parsed:
-            top_items.append(parsed)
-
-    tree_count = 0
-    for name, size_raw, is_dir in top_items:
-        if tree_count > 0:
-            lines.append("")  # 空行分隔树
-        if is_dir:
-            lines.append(f"📁 {name}/")
-            all_items.append({"path": f"{cloud_dir}/{name}", "name": name, "size": "-", "is_dir": True})
-            _list_dir(f"{cloud_dir}/{name}", 1)
-        else:
-            lines.append(f"📄 {name}  ({_format_size(size_raw)})")
-            all_items.append({"path": f"{cloud_dir}/{name}", "name": name, "size": size_raw, "is_dir": False})
-        tree_count += 1
-
+    _walk("", 0)
     if not lines:
-        return {"error": "目录为空"}
+        return {"error": "目录为空或获取失败"}
+    if state["truncated"]:
+        lines.append("（目录过多已截断，建议用 /pan file <路径> 直接下载需要的文件）")
+    return {"text": "\n".join(lines), "items": items}
 
-    return {"text": "\n".join(lines), "items": all_items, "own_share": False}
+
+def list_share_content(surl: str, pwd: str = "") -> dict:
+    """列出分享目录树（API 直连，不转存、不占网盘空间）。"""
+    result = _list_share_tree_api(surl, pwd)
+    if "error" in result:
+        return result
+    return {"text": result["text"], "items": result["items"], "own_share": False}
 
 
 def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None) -> dict:
@@ -997,7 +1060,7 @@ def _get_local_file_size(file_name: str) -> int:
     "astrbot_plugin_baidu_pan",
     "linker9527",
     "百度网盘分享文件自动下载发送",
-    "1.7.0",
+    "1.8.0",
     "https://github.com/linker9527/astrbot_plugin_baidu_pan",
 )
 class BaiduPanPlugin(Star):
@@ -1091,12 +1154,10 @@ class BaiduPanPlugin(Star):
             logger.info("[BaiduPan] bduuss 配置自动登录成功")
 
     def _transfer_and_list(self, surl: str, pwd: str) -> dict:
-        """线程安全的"切换分享链接"：清理旧转存 + 转存并列目录 + 更新缓存。
-        锁在同步函数内，配合 asyncio.to_thread 调用不会阻塞事件循环。"""
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        """线程安全的"切换分享链接"：API 直连列出分享目录树并更新缓存。
+        列目录不转存、也不删暂存目录（下载改为按需精准转存单个文件/文件夹，
+        下载完成后由 auto_delete_cloud 清理），多用户查看不同链接互不影响。"""
         with _share_switch_lock:
-            if self._cached_surl and self._cached_surl != surl:
-                _run_bpcs(["rm", cloud_dir], timeout=30)
             result = list_share_content(surl, pwd)
             if "error" not in result:
                 self._cached_surl = surl
@@ -1105,8 +1166,36 @@ class BaiduPanPlugin(Star):
                 self._cached_items = result.get("items", [])
         return result
 
+    def _ensure_transferred_sync(self, cloud_path: str) -> dict:
+        """把选中的分享内容（单个文件/文件夹）按 fs_id 精准转存到暂存目录。
+        只转存所需项，避免整包转存撑爆网盘空间（大分享整包动辄上 TB）。
+        返回 {"name": 转存后的文件/文件夹名} 或 {"error": ...}。"""
+        if not self._cached_surl:
+            return {"error": "请先查看目录: /pan <链接> [密码]"}
+        items = self._cached_items or []
+        target = next((it for it in items if it.get("path") == cloud_path), None)
+        if not target and items:
+            # 路径没命中（树被截断/缓存过期）：重新拉取目录树再找
+            refreshed = _list_share_tree_api(self._cached_surl, self._cached_pwd)
+            if "error" not in refreshed:
+                self._cached_items = refreshed.get("items", [])
+                self._cached_tree = refreshed.get("text", "")
+                items = self._cached_items
+                target = next((it for it in items if it.get("path") == cloud_path), None)
+        if not target:
+            base = cloud_path.strip("/").split("/")[-1]
+            target = next((it for it in items if it.get("name") == base), None)
+        if not target:
+            return {"error": f"分享中找不到「{cloud_path}」，请先 /pan <链接> 查看目录"}
+        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        r = _transfer_via_api(self._cached_surl, self._cached_pwd, cloud_dir,
+                              fs_ids=[target["fs_id"]])
+        if "error" in r:
+            return r
+        return {"name": target["name"]}
+
     def _check_switch_allowed(self, surl: str) -> str:
-        """切换到新链接前检查是否有下载正在进行（避免删掉正在下载的转存文件）。"""
+        """切换到新链接前检查是否有下载正在进行（避免缓存被覆盖导致路径串台）。"""
         if surl and self._cached_surl != surl and self._active_downloads:
             return "⏳ 当前有下载任务进行中，请稍后再查看其他链接"
         return ""
@@ -1297,8 +1386,12 @@ class BaiduPanPlugin(Star):
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads.add(dl_key)
         try:
+            # 按需精准转存：只转存选中的文件夹，再从暂存目录下载
+            tr = await asyncio.to_thread(self._ensure_transferred_sync, folder_path)
+            if "error" in tr:
+                return tr["error"]
             prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, folder_path, self._get_max_mb(), prog_q))
+            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
             if prog_q:
                 file_info = None
                 _last_prog_size = None
@@ -1370,7 +1463,13 @@ class BaiduPanPlugin(Star):
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads.add(dl_key)
         try:
-            # 下载整个转存目录
+            # 先转存分享根目录全部文件到暂存目录，再整体下载
+            # （特大分享会因网盘剩余空间不足失败，错误信息会提示改用按文件下载）
+            tr = await asyncio.to_thread(
+                _transfer_via_api, self._cached_surl, self._cached_pwd,
+                CLOUD_SAVE_DIR or "/我的资源/AutoTransfer")
+            if "error" in tr:
+                return tr["error"]
             prog_q = queue.Queue() if self._progress_enabled else None
             dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, "", self._get_max_mb(), prog_q))
             if prog_q:
@@ -1663,8 +1762,12 @@ class BaiduPanPlugin(Star):
             try:
                 logger.info(f"[BaiduPan] on_pan dir: dir_path={dir_path}, progress_enabled={self._progress_enabled}")
                 yield event.plain_result(f"⏳ 正在下载文件夹: {dir_path} ...")
+                tr = await asyncio.to_thread(self._ensure_transferred_sync, dir_path)
+                if "error" in tr:
+                    yield event.plain_result(f"❌ {tr['error']}")
+                    return
                 prog_q = queue.Queue() if self._progress_enabled else None
-                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, dir_path, self._get_max_mb(), prog_q))
+                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
                 if prog_q:
                     file_info = None
                     _last_prog_size = None
@@ -1750,8 +1853,12 @@ class BaiduPanPlugin(Star):
             try:
                 logger.info(f"[BaiduPan] on_pan file: f_path={f_path}, progress_enabled={self._progress_enabled}")
                 yield event.plain_result(f"⏳ 正在下载文件: {f_path} ...")
+                tr = await asyncio.to_thread(self._ensure_transferred_sync, f_path)
+                if "error" in tr:
+                    yield event.plain_result(f"❌ {tr['error']}")
+                    return
                 prog_q = queue.Queue() if self._progress_enabled else None
-                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, f_path, self._get_max_mb(), prog_q))
+                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
                 if prog_q:
                     file_info = None
                     _last_prog_size = None
