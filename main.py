@@ -51,6 +51,9 @@ _bpcs_inited = False
 _bpcs_lock = threading.Lock()
 _auto_delete_cloud = True
 _local_cleanup_hour = 3
+# 模拟真实浏览器的请求头，降低被百度风控识别为自动化流量的概率
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 _exe_ok_cache = {"sig": None}  # 已验证可用的 exe 的 (mtime, size)，避免每次请求都 spawn 进程
 _cleanup_thread_started = False
 _share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
@@ -418,7 +421,11 @@ def _build_pan_session() -> object:
         return None
 
     sess = _req.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    sess.headers.update({
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
     # 如果只有 BDUSS 没有完整 cookie，用 BDUSS 做一个简单 session
     if "BDUSS=" not in cookies_str and "=" not in cookies_str:
         sess.cookies.set("BDUSS", cookies_str, domain=".baidu.com")
@@ -1510,7 +1517,7 @@ class BaiduPanPlugin(Star):
 
         if parts[0] == "qrlogin":
             sess = _req.Session()
-            sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            sess.headers.update({"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             # Step 1: 获取二维码（session 会自动保存 BAIDUID 等初始 cookie）
             try:
                 r = await asyncio.to_thread(
