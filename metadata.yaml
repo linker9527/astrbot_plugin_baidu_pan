@@ -4,7 +4,7 @@ author: linker9527
 author_url: https://github.com/linker9527
 description: 百度网盘分享自动下载发送插件。核心优势：共享会员——一个百度账号登录，全群成员共享高速下载，人人无需开通会员。主推扫码登录（无需密码，不怕风控），不收集、不存储、不传输任何账号密码，源码完全开源可审计。支持 napcat/SnowLuma/QQ官方机器人等多平台
 short_desc: 共享会员：一个账号全群免会员下载，主推扫码登录不盗号
-version: 1.6.1
+version: 1.7.0
 repo: https://github.com/linker9527/astrbot_plugin_baidu_pan
 category: 工具
 tags:
@@ -18,15 +18,26 @@ help: |
   首次使用请先执行 /pan download 下载 BaiduPCS-Go 工具
 
   命令:
-  /pan <链接或surl> [提取码] - 下载并发送百度网盘分享文件
-  支持完整链接和surl两种格式
+  /pan <链接或surl> [提取码] - 转存并查看分享目录树
+  /pan look - 重新查看最近一次的目录树
+  /pan dir <文件夹路径> - 下载文件夹
+  /pan file <文件路径> - 下载指定文件
+  /pan qrlogin - 扫码登录（推荐）
+  /pan bduss <BDUSS> [STOKEN] - BDUSS 登录
+  /pan cookies <完整Cookie字符串> - Cookie 登录
+  /pan login <账号> <密码> - 账密登录
+  /pan unlogin - 退出登录
   /pan download - 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可用此命令修复）
   /pan download git - 强制从 GitHub 官方 release 下载（国内镜像失效时使用）
 
   配置:
-  bduuss - 百度网盘登录Cookie BDUSS
-  max_file_size - 最大下载文件大小（MB）
+  bduuss - 百度网盘 BDUSS Cookie（填写后启动时自动登录，留空不启用）
+  max_file_size - 最大下载文件大小（MB），0=不限制（official 模式硬限 200MB）
   send_mode - 发送模式：onebot(napcat) / official(QQ官方) / other(其他平台)
-  progress_interval - 进度推送间隔（秒），默认5
+  blacklist - 用户黑名单，多个用英文逗号隔开（仅 onebot 模式生效）
   download_dir - 文件下载目录（留空用插件目录 storage/downloads/）
+  cloud_save_dir - 网盘转存目录（留空用默认 /我的资源/AutoTransfer）
+  auto_delete_cloud - 下载完成后自动删除网盘转存文件
+  local_cleanup_hour - 每天定时清理插件下载的本地文件（只清理插件下载的文件，-1=关闭）
+  progress_enabled / progress_interval - 下载进度显示开关及推送间隔（秒）
   timeout_seconds - 下载超时时间（秒），-1表示不超时

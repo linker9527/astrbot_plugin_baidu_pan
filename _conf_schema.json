@@ -11,6 +11,12 @@
     ],
     "default": "read"
   },
+  "bduuss": {
+    "type": "string",
+    "description": "百度网盘 BDUSS Cookie（可选）",
+    "hint": "扫码登录的替代方案。浏览器登录 pan.baidu.com → F12 → Application → Cookies → 复制 BDUSS 值填入，插件启动时自动登录。留空则不启用",
+    "default": ""
+  },
   "max_file_size": {
     "type": "int",
     "description": "下载大小限制（MB），0=不限制",
@@ -63,7 +69,7 @@
   "local_cleanup_hour": {
     "type": "int",
     "description": "每天定时清理本地下载文件（0-23点，-1=关闭）",
-    "hint": "填入小时数（0-23），如填3表示每天凌晨3点清理下载目录中的文件。填-1则不自动清理",
+    "hint": "填入小时数（0-23），如填3表示每天凌晨3点清理插件下载到本地的文件。只清理本插件下载的文件，不会动下载目录里的其他文件。填-1则不自动清理",
     "default": 3
   },
   "progress_enabled": {

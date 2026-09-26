@@ -22,6 +22,11 @@ from astrbot.api.star import Star, Context, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.star.filter.command import GreedyStr
 
+try:
+    from astrbot.api.event import MessageChain
+except ImportError:  # 兼容旧版 AstrBot
+    from astrbot.core.message.message_event_result import MessageChain
+
 BPCS_PATH = os.path.join(os.path.dirname(__file__), "BaiduPCS-Go.exe")
 # BaiduPCS-Go 官方 release 信息（下载 URL 和文件大小从 GitHub API 实时获取，不硬编码哈希值）
 BPCS_VERSION = "v4.0.1"
@@ -39,21 +44,35 @@ CLOUD_SAVE_DIR = None  # 网盘转存目录
 FLASH_TASK_LIMIT_MB = 200
 DOWNLOAD_TIMEOUT_SECONDS = -1  # 下载超时秒数，-1 = 不超时（可在配置中修改）
 
+# 本插件下载过的本地文件清单，定时清理时只删这些，不动下载目录里的其他文件
+_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "storage", "cleanup_manifest.json")
+
 _bpcs_inited = False
 _bpcs_lock = threading.Lock()
 _auto_delete_cloud = True
 _local_cleanup_hour = 3
+_exe_ok_cache = {"sig": None}  # 已验证可用的 exe 的 (mtime, size)，避免每次请求都 spawn 进程
+_cleanup_thread_started = False
+_share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
 
 
 def _ensure_bpcs_exe() -> bool:
-    """检查 BaiduPCS-Go.exe 是否存在且可运行。不存在或损坏时返回 False。"""
-    if not os.path.exists(BPCS_PATH):
+    """检查 BaiduPCS-Go.exe 是否存在且可运行。不存在或损坏时返回 False。结果按文件签名缓存。"""
+    try:
+        st = os.stat(BPCS_PATH)
+    except OSError:
         return False
+    sig = (st.st_mtime_ns, st.st_size)
+    if _exe_ok_cache["sig"] == sig:
+        return True
     try:
         r = subprocess.run([BPCS_PATH, "--version"], capture_output=True, text=True, timeout=10)
-        return r.returncode == 0
+        ok = r.returncode == 0
     except Exception:
-        return False
+        ok = False
+    if ok:  # 只缓存成功结果，失败时下次重试
+        _exe_ok_cache["sig"] = sig
+    return ok
 
 
 def _fetch_release_info() -> dict | None:
@@ -215,11 +234,13 @@ def _run_bpcs(args: list, timeout: int = 300) -> tuple:
     try:
         r = subprocess.run(
             [BPCS_PATH] + args, capture_output=True, text=True,
-            timeout=timeout, encoding="utf-8"
+            timeout=timeout, encoding="utf-8", errors="replace"
         )
-        return r.stdout, r.stderr, r.returncode
+        return r.stdout or "", r.stderr or "", r.returncode
     except subprocess.TimeoutExpired:
         return "", "TIMEOUT", -1
+    except Exception as e:
+        return "", str(e), -2
 
 
 def _init_bpcs() -> bool:
@@ -240,6 +261,16 @@ def _init_bpcs() -> bool:
             return True
         logger.info("[BaiduPan] BaiduPCS-Go not logged in, use /pan login")
         return False
+
+
+def _bpcs_config_path() -> str:
+    """BaiduPCS-Go 的 pcs_config.json 路径（支持 BAIDUPCS_GO_CONFIG_DIR 环境变量）。"""
+    env = os.environ.get("BAIDUPCS_GO_CONFIG_DIR")
+    if env:
+        return os.path.join(env, "pcs_config.json")
+    return os.path.join(
+        os.path.expanduser("~"), "AppData", "Roaming", "BaiduPCS-Go", "pcs_config.json"
+    )
 
 
 def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
@@ -265,13 +296,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
 def _patch_config_stoken(stoken: str, bduss: str = ""):
     """手动补写 pcs_config.json 中的 stoken 和 bduss 字段。
     login -cookies= 不会自动填充 stoken 字段，但 transfer 需要它。"""
-    import json as _json
-    config_path = os.path.join(
-        os.environ.get("BAIDUPCS_GO_CONFIG_DIR", ""),
-        "pcs_config.json"
-    ) if os.environ.get("BAIDUPCS_GO_CONFIG_DIR") else os.path.join(
-        os.path.expanduser("~"), "AppData", "Roaming", "BaiduPCS-Go", "pcs_config.json"
-    )
+    config_path = _bpcs_config_path()
     if not os.path.exists(config_path):
         logger.warning(f"[BaiduPan] pcs_config.json not found at {config_path}")
         return
@@ -320,10 +345,31 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
 
 
 def login_bpcs(username: str, password: str) -> dict:
-    """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。"""
+    """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。
+    优先走交互式 stdin 输入，避免密码出现在进程命令行（同机其他进程可见）。"""
     global _bpcs_inited
     if not _ensure_bpcs_exe():
         return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
+
+    # 方式一：交互式输入（密码不进命令行）
+    try:
+        proc = subprocess.Popen(
+            [BPCS_PATH, "login"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        out_bytes, _ = proc.communicate(
+            input=f"{username}\n{password}\n".encode("utf-8"), timeout=60
+        )
+        text = (out_bytes or b"").decode("utf-8", errors="replace")
+        if proc.returncode == 0 and "失败" not in text and "错误" not in text:
+            _bpcs_inited = True
+            logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login (stdin)")
+            return {"success": True, "output": text.strip()[:300]}
+        logger.info(f"[BaiduPan] stdin login 未成功，回退参数方式: rc={proc.returncode}")
+    except Exception as e:
+        logger.warning(f"[BaiduPan] stdin login 异常，回退参数方式: {e}")
+
+    # 方式二：参数式（兜底）
     out, err, code = _run_bpcs(
         ["login", f"-username={username}", f"-password={password}"], timeout=60
     )
@@ -355,12 +401,7 @@ def logout_bpcs() -> dict:
 def _build_pan_session() -> object:
     """从 pcs_config.json 读取 cookies，构建已登录的 requests.Session。
     自动访问 pan.baidu.com/disk/main 获取 csrfToken / PANPSC 等 pan 专用 cookie。"""
-    cfg_path = os.path.join(
-        os.environ.get("BAIDUPCS_GO_CONFIG_DIR", ""),
-        "pcs_config.json"
-    ) if os.environ.get("BAIDUPCS_GO_CONFIG_DIR") else os.path.join(
-        os.path.expanduser("~"), "AppData", "Roaming", "BaiduPCS-Go", "pcs_config.json"
-    )
+    cfg_path = _bpcs_config_path()
     if not os.path.exists(cfg_path):
         logger.warning("[BaiduPan] pcs_config.json not found, cannot build pan session")
         return None
@@ -401,6 +442,13 @@ def _build_pan_session() -> object:
     return sess
 
 
+def _grab_share_field(html: str, key: str) -> str:
+    """从分享页 HTML 中提取单个字段值（兼容引号/数值两种形式）。
+    不做整页 JSON 解析，避免正则改写 URL/时间等内容导致解析失败。"""
+    m = re.search(rf'["\']{re.escape(key)}["\']\s*:\s*["\']?([A-Za-z0-9_\-.]*)', html or "")
+    return m.group(1) if m else ""
+
+
 def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
     """用 Python requests 直接调用百度网盘 API 转存分享链接到指定目录。
     替代 BaiduPCS-Go 的 transfer 命令（v4.0.1 有 cookie 传递 bug）。
@@ -418,17 +466,11 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
         # Step 1: 访问分享页，获取 bdstoken / share_uk / shareid
         r = sess.get(share_link, timeout=10,
                      headers={"Referer": "https://pan.baidu.com/disk/home"})
-        m = re.search(r'window\.yunData\s*=\s*(\{.+?\});', r.text)
-        if not m:
-            return {"error": "访问分享页失败，可能需要重新登录"}
-        yd = re.sub(r"'", '"', m.group(1))
-        yd = re.sub(r'(\w+):', r'"\1":', yd)
-        yd = _json.loads(yd)
-        if yd.get("loginstate", "0") == "0":
+        if _grab_share_field(r.text, "loginstate") == "0":
             return {"error": "网盘未登录，请使用 /pan qrlogin 重新登录"}
-        bdstoken = yd.get("bdstoken", "")
-        share_uk = yd.get("share_uk", "")
-        shareid = yd.get("shareid", "")
+        bdstoken = _grab_share_field(r.text, "bdstoken")
+        share_uk = _grab_share_field(r.text, "share_uk") or _grab_share_field(r.text, "uk")
+        shareid = _grab_share_field(r.text, "shareid")
         if not bdstoken or not shareid:
             return {"error": "无法获取分享信息，链接可能已失效"}
         logger.info(f"[BaiduPan] transfer: shareid={shareid}, bdstoken={bdstoken[:16]}...")
@@ -456,18 +498,14 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
         # Step 3: 重新访问分享页（带 init referer），获取新 bdstoken
         r3 = sess.get(share_link, timeout=10,
                       headers={"Referer": f"https://pan.baidu.com/share/init?surl={surl}"})
-        m = re.search(r'window\.yunData\s*=\s*(\{.+?\});', r3.text)
-        if m:
-            yd2 = re.sub(r"'", '"', m.group(1))
-            yd2 = re.sub(r'(\w+):', r'"\1":', yd2)
-            yd2 = _json.loads(yd2)
-            bdstoken = yd2.get("bdstoken", bdstoken)
+        bdstoken = _grab_share_field(r3.text, "bdstoken") or bdstoken
 
-        # Step 4: 获取文件列表
+        # Step 4: 获取文件列表（短链一般以 1 开头，list 接口要求去掉）
+        short = surl[1:] if surl.startswith("1") else surl
         list_url = (
             f"https://pan.baidu.com/share/list"
             f"?bdstoken={bdstoken}&root=1&web=5&app_id=250528"
-            f"&shorturl={surl[1:]}&channel=chunlei&clienttype=0"
+            f"&shorturl={short}&channel=chunlei&clienttype=0"
         )
         r4 = sess.get(list_url, timeout=10, headers={"Referer": share_link})
         resp4 = r4.json()
@@ -521,59 +559,83 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
             return {"error": f"转存失败(errno={errno}): {show_msg}"}
 
     except Exception as e:
-        import traceback
         logger.exception(f"[BaiduPan] transfer API error: {e}")
         return {"error": f"转存API调用异常: {e}"}
 
 
-def _cleanup_local_dir():
-    """清理本地下载目录中的所有文件。"""
-    if not DOWNLOAD_DIR or not os.path.exists(DOWNLOAD_DIR):
-        return
-    count = 0
+def _manifest_load() -> set:
+    """读取本插件下载过的文件清单。"""
     try:
-        for fname in os.listdir(DOWNLOAD_DIR):
-            fpath = os.path.join(DOWNLOAD_DIR, fname)
-            if os.path.isfile(fpath):
-                os.remove(fpath)
-                count += 1
-        logger.info(f"[BaiduPan] local cleanup: removed {count} files from {DOWNLOAD_DIR}")
+        with open(_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return set(data.get("files", [])) if isinstance(data, dict) else set(data)
+    except Exception:
+        return set()
+
+
+def _manifest_save(paths: set):
+    try:
+        os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
+        with open(_MANIFEST_PATH, "w", encoding="utf-8") as f:
+            _json.dump({"files": sorted(paths)}, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"[BaiduPan] local cleanup error: {e}")
+        logger.warning(f"[BaiduPan] save cleanup manifest failed: {e}")
+
+
+def _manifest_add(paths: list):
+    """登记插件下载到本地的文件，供定时清理使用。"""
+    new = {p for p in paths if p}
+    if not new:
+        return
+    _manifest_save(_manifest_load() | new)
+
+
+def _cleanup_local_dir():
+    """清理本插件下载并登记过的本地文件（不会动下载目录里的其他文件）。"""
+    paths = _manifest_load()
+    if not paths:
+        return
+    removed = 0
+    remain = set()
+    for p in paths:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed += 1
+            elif os.path.exists(p):
+                remain.add(p)  # 目录等非普通文件，保留不动
+        except Exception as e:
+            logger.warning(f"[BaiduPan] cleanup skip {p}: {e}")
+            remain.add(p)
+    _manifest_save(remain)
+    if removed:
+        logger.info(f"[BaiduPan] local cleanup: removed {removed} plugin-downloaded files")
 
 
 def _schedule_local_cleanup(hour: int):
-    """安排每天定时清理本地下载文件。"""
+    """安排每天定时清理本地下载文件（仅清理插件自己下载的文件）。"""
+    global _cleanup_thread_started
     if hour < 0 or hour > 23:
         logger.info("[BaiduPan] local auto-cleanup disabled")
         return
-    try:
-        from astrbot.core import star
-        # 使用 AstrBot 的定时任务机制
-        import asyncio
-        async def _cleanup_loop():
-            while True:
-                now = time.localtime()
-                # 计算到目标小时的秒数
-                target = int(time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
-                                          hour, 0, 0, now.tm_wday, now.tm_yday, now.tm_isdst)))
-                if target <= time.time():
-                    target += 86400  # 明天
-                wait_secs = target - time.time()
-                await asyncio.sleep(wait_secs)
-                _cleanup_local_dir()
-                await asyncio.sleep(86400)  # 等24小时再跑下一次
-        # 启动后台协程
-        import threading
-        def _start_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_cleanup_loop())
-        t = threading.Thread(target=_start_loop, daemon=True)
-        t.start()
-        logger.info(f"[BaiduPan] scheduled local cleanup at {hour}:00 daily")
-    except Exception as e:
-        logger.warning(f"[BaiduPan] schedule cleanup failed: {e}")
+    if _cleanup_thread_started:
+        logger.info("[BaiduPan] local cleanup thread already running, skip")
+        return
+    _cleanup_thread_started = True
+
+    def _worker():
+        while True:
+            now = time.localtime()
+            target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
+                                  hour, 0, 0, 0, 0, -1))
+            if target <= time.time():
+                target += 86400  # 明天
+            time.sleep(max(target - time.time(), 1))
+            _cleanup_local_dir()
+            time.sleep(60)
+
+    threading.Thread(target=_worker, daemon=True, name="baidupan-cleanup").start()
+    logger.info(f"[BaiduPan] scheduled local cleanup at {hour}:00 daily")
 
 
 def parse_share_link(link: str) -> tuple:
@@ -594,130 +656,56 @@ def parse_share_link(link: str) -> tuple:
     return surl, pwd
 
 
-def download_share(surl: str, pwd: str = "", max_mb: int = 200) -> dict:
-    share_url = f"https://pan.baidu.com/s/{surl}"
-    max_bytes = max_mb * 1024 * 1024
+def _parse_size_bytes(raw_size: str) -> int:
+    """解析 BPCS ls 输出的大小字符串（如 1.5GB / 300KB / -）为字节数，失败返回 0。"""
+    raw = (raw_size or "").strip().upper()
+    if not raw or raw == "-":
+        return 0
+    try:
+        for unit, mult in (("TB", 1024 ** 4), ("GB", 1024 ** 3),
+                           ("MB", 1024 ** 2), ("KB", 1024)):
+            if raw.endswith(unit):
+                return int(float(raw[:-len(unit)]) * mult)
+        if raw.endswith("B"):
+            return int(float(raw[:-1]))
+        return int(float(raw))
+    except ValueError:
+        return 0
 
-    # Step 1: transfer share to own cloud (via Python API, bypassing BPCS v4.0.1 cookie bug)
-    cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-    import subprocess as _subprocess
-    transfer_path = cloud_dir
-    result = _transfer_via_api(surl, pwd, transfer_path)
-    if "error" in result:
-            return {"error": result["error"]}
-    logger.info(f"[BaiduPan] transfer API success: {result.get('filenames', [])}")
 
-    # Step 2: find file in cloud storage
-    own_share = result.get("_own_share", False)
-    target = None
+def _format_size(raw_size: str) -> str:
+    """解析 BPCS ls 输出的文件大小字符串并格式化。"""
+    b = _parse_size_bytes(raw_size)
+    if b <= 0:
+        return raw_size
+    for unit, threshold in (("TB", 1024 ** 4), ("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if b >= threshold:
+            return f"{b / threshold:.2f} {unit}"
+    return f"{b:.0f} B"
 
-    if own_share:
-        for fname in result.get("filenames", []):
-            search_out, _, _ = _run_bpcs(["search", fname], timeout=60)
-            for line in search_out.strip().split("\n"):
-                line = line.strip()
-                parts = line.split()
-                if len(parts) >= 10 and parts[3] != "-" and parts[-1] == fname:
-                    raw_size = parts[3]
-                    size_bytes = 0
-                    try:
-                        if raw_size.upper().endswith("GB"):
-                            size_bytes = int(float(raw_size[:-2]) * 1024 * 1024 * 1024)
-                        elif raw_size.upper().endswith("MB"):
-                            size_bytes = int(float(raw_size[:-2]) * 1024 * 1024)
-                        elif raw_size.upper().endswith("KB"):
-                            size_bytes = int(float(raw_size[:-2]) * 1024)
-                        elif raw_size.upper().endswith("TB"):
-                            size_bytes = int(float(raw_size[:-2]) * 1024 * 1024 * 1024 * 1024)
-                        elif raw_size.upper().endswith("B"):
-                            size_bytes = int(float(raw_size[:-1]))
-                        else:
-                            size_bytes = int(float(raw_size))
-                    except (ValueError, IndexError):
-                        continue
-                    target = {"size": size_bytes, "name": fname, "path": fname}
-                    logger.info(f"[BaiduPan] found own file via search: {fname} ({size_bytes} bytes)")
-                    break
-            if target:
-                break
-        if not target:
-            return {"error": f"自己的分享链接，但云端搜索不到文件 '{result.get('filenames', ['?'])[0]}'，可能已被删除，请重新上传后分享"}
-    else:
-        out, err, code = _run_bpcs(["ls", "-l", transfer_path], timeout=60)
-        if code != 0:
-            return {"error": "获取文件列表失败"}
 
-        for line in out.strip().split("\n"):
-            line = line.strip()
-            if (not line or line.startswith("#") or line.startswith("当前")
-                    or line.startswith("总") or "Total:" in line
-                    or "----" in line or "获取" in line):
-                continue
-            parts = line.split()
-            if len(parts) >= 10 and parts[3] != "-":
-                raw_size = parts[3]
-                size_bytes = 0
-                try:
-                    if raw_size.upper().endswith("GB"):
-                        size_bytes = int(float(raw_size[:-2]) * 1024 * 1024 * 1024)
-                    elif raw_size.upper().endswith("MB"):
-                        size_bytes = int(float(raw_size[:-2]) * 1024 * 1024)
-                    elif raw_size.upper().endswith("KB"):
-                        size_bytes = int(float(raw_size[:-2]) * 1024)
-                    elif raw_size.upper().endswith("TB"):
-                        size_bytes = int(float(raw_size[:-2]) * 1024 * 1024 * 1024 * 1024)
-                    elif raw_size.upper().endswith("B"):
-                        size_bytes = int(float(raw_size[:-1]))
-                    else:
-                        size_bytes = int(float(raw_size))
-                except (ValueError, IndexError):
-                    continue
-                name = parts[-1]
-                target = {"size": size_bytes, "name": name, "path": f"{transfer_path}/{name}"}
-                break
+# BPCS ls -l 行结构: 序号 FSID APPID 大小 创建日期 时间 修改日期 时间 [MD5] 文件名(可含空格)
+_BPCS_LS_RE = re.compile(
+    r'^\s*\d+\s+\d+\s+\d+\s+(\S+)\s+'
+    r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+'
+    r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+'
+    r'(?:[0-9a-fA-F]{32}\s+)?(.+?)\s*$'
+)
 
-        if not target:
-            return {"error": "转存后未找到可下载文件，请检查网盘转存目录"}
 
-    if max_mb > 0 and target["size"] > max_bytes:
-        return {"error": f"文件过大({target['size']//1024//1024}MB)超过{max_mb}MB限制，请自行下载: {share_url}"}
-
-    # Step 3: download (超时按文件大小动态计算，配置了 timeout_seconds 则优先使用；-1 不超时)
-    # 重新设置 savedir 确保下载到正确目录
-    _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
-    dl_timeout = DOWNLOAD_TIMEOUT_SECONDS if DOWNLOAD_TIMEOUT_SECONDS > 0 else max(600, int(target["size"] / (1024 * 1024) * 15))
-    out, err, code = _run_bpcs(
-        ["download", target["path"], "--ow"], timeout=dl_timeout
-    )
-    if code != 0 or "失败" in (out or "") or "错误" in (out or ""):
-        logger.error(f"[BaiduPan] download failed: code={code}, out={out[:200]}, err={err[:200]}")
-        return {"error": "下载失败"}
-
-    # Find downloaded file: BaiduPCS-Go 保存的文件名一般是原名
-    if not DOWNLOAD_DIR:
-        return {"error": "下载目录未设置"}
-    logger.info(f"[BaiduPan] download done, looking in {DOWNLOAD_DIR} for {target['name']}")
-    candidates = [
-        os.path.join(DOWNLOAD_DIR, target["name"]),
-        os.path.join(DOWNLOAD_DIR, f"{surl}_{target['name']}"),
-    ]
-    local_path = next((p for p in candidates if os.path.exists(p)), None)
-    if not local_path:
-        for f in os.listdir(DOWNLOAD_DIR):
-            if f == target["name"] or f.startswith(surl):
-                local_path = os.path.join(DOWNLOAD_DIR, f)
-                break
-
-    if not local_path or not os.path.exists(local_path):
-        logger.warning(f"[BaiduPan] file not found in {DOWNLOAD_DIR}, files: {os.listdir(DOWNLOAD_DIR)[:20]}")
-        return {"error": "下载完成但未找到文件"}
-
-    # Step 4: delete from cloud after successful download
-    # Step 4: delete from cloud after successful download (if enabled)
-    if _auto_delete_cloud:
-        _run_bpcs(["rm", target["path"]], timeout=30)
-    return {"path": local_path, "size": os.path.getsize(local_path), "name": target["name"]}
-
+def _parse_ls_line(line: str):
+    """解析 BPCS ls -l 的一行文件记录。
+    返回 (name, size_raw, is_dir)，非文件行返回 None。
+    按日期列定位文件名起点，支持文件名含空格。"""
+    m = _BPCS_LS_RE.match(line)
+    if not m:
+        return None
+    size_raw, name = m.group(1), m.group(2)
+    is_dir = size_raw == "-" or name.endswith("/")
+    name = name.rstrip("/")
+    if not name:
+        return None
+    return name, size_raw, is_dir
 
 
 def list_share_content(surl: str, pwd: str = "") -> dict:
@@ -726,132 +714,111 @@ def list_share_content(surl: str, pwd: str = "") -> dict:
     result = _transfer_via_api(surl, pwd, cloud_dir)
     if "error" in result:
         return {"error": result["error"]}
-    
+
     own_share = result.get("_own_share", False)
     filenames = result.get("filenames", [])
-    
+
     lines = []
     all_items = []  # [(path, name, size, is_dir)]
-    
+
     if own_share:
         lines.append("⚠️ 这是你自己的分享链接，API 无法重复转存")
         lines.append(f"   分享中的文件: {', '.join(filenames)}")
         lines.append("   如需下载，请直接从网盘原目录操作")
         return {"text": "\n".join(lines), "items": [], "own_share": True}
-    
+
     # 递归列出目录内容
-    def _list_dir(dir_path: str, indent: int = 0, collect_items: bool = True):
-        nonlocal all_items
+    def _list_dir(dir_path: str, indent: int = 0):
+        if indent > 10:  # 防御过深的目录嵌套
+            return
         out, _, code = _run_bpcs(["ls", "-l", dir_path], timeout=60)
         if code != 0:
             return
         prefix = "  " * indent
-        for line in out.strip().split("\n"):
-            line = line.strip()
-            if (not line or line.lstrip().startswith("#") or line.startswith("当前")
-                    or line.startswith("总") or "Total:" in line
-                    or "----" in line or "获取" in line):
+        for line in out.split("\n"):
+            parsed = _parse_ls_line(line)
+            if not parsed:
                 continue
-            parts = line.split()
-            if len(parts) >= 9:
-                name = parts[-1]
-                raw_size = parts[3]
-                is_dir = (raw_size == "-")
-                size_str = raw_size if is_dir else _format_size(raw_size)
-                if is_dir:
-                    lines.append(f"{prefix}📁 {name}/")
-                    if collect_items:
-                        all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": "-", "is_dir": True})
-                    _list_dir(f"{dir_path}/{name}", indent + 1, collect_items)
-                else:
-                    lines.append(f"{prefix}📄 {name}  ({size_str})")
-                    if collect_items:
-                        all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": raw_size, "is_dir": False})
-    
+            name, size_raw, is_dir = parsed
+            if is_dir:
+                lines.append(f"{prefix}📁 {name}/")
+                all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": "-", "is_dir": True})
+                _list_dir(f"{dir_path}/{name}", indent + 1)
+            else:
+                lines.append(f"{prefix}📄 {name}  ({_format_size(size_raw)})")
+                all_items.append({"path": f"{dir_path}/{name}", "name": name, "size": size_raw, "is_dir": False})
+
     # 获取顶层目录内容，不展示顶层目录名，子目录各自成树，空行分隔
     out, _, code = _run_bpcs(["ls", "-l", cloud_dir], timeout=60)
     if code != 0:
         return {"error": "获取目录列表失败"}
-    
+
     top_items = []
-    for line in out.strip().split("\n"):
-        line = line.strip()
-        if (not line or line.lstrip().startswith("#") or line.startswith("当前")
-                or line.startswith("总") or "Total:" in line
-                or "----" in line or "获取" in line):
-            continue
-        parts = line.split()
-        if len(parts) >= 9:
-            name = parts[-1]
-            raw_size = parts[3]
-            is_dir = (raw_size == "-")
-            top_items.append({"name": name, "is_dir": is_dir, "raw_size": raw_size})
-    
+    for line in out.split("\n"):
+        parsed = _parse_ls_line(line)
+        if parsed:
+            top_items.append(parsed)
+
     tree_count = 0
-    for item in top_items:
+    for name, size_raw, is_dir in top_items:
         if tree_count > 0:
             lines.append("")  # 空行分隔树
-        if item["is_dir"]:
-            lines.append(f"📁 {item['name']}/")
-            all_items.append({"path": f"{cloud_dir}/{item['name']}", "name": item["name"], "size": "-", "is_dir": True})
-            _list_dir(f"{cloud_dir}/{item['name']}", 1)
+        if is_dir:
+            lines.append(f"📁 {name}/")
+            all_items.append({"path": f"{cloud_dir}/{name}", "name": name, "size": "-", "is_dir": True})
+            _list_dir(f"{cloud_dir}/{name}", 1)
         else:
-            lines.append(f"📄 {item['name']}  ({_format_size(item['raw_size'])})")
-            all_items.append({"path": f"{cloud_dir}/{item['name']}", "name": item["name"], "size": item["raw_size"], "is_dir": False})
+            lines.append(f"📄 {name}  ({_format_size(size_raw)})")
+            all_items.append({"path": f"{cloud_dir}/{name}", "name": name, "size": size_raw, "is_dir": False})
         tree_count += 1
-    
+
     if not lines:
         return {"error": "目录为空"}
-    
+
     return {"text": "\n".join(lines), "items": all_items, "own_share": False}
-def download_share_path(surl: str, pwd: str, cloud_path: str, max_mb: int = 0) -> dict:
-    """转存后下载指定路径的文件或文件夹（含所有内容）。"""
+
+
+def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None) -> dict:
+    """从网盘下载指定路径的文件或文件夹（不转存，直接下载已有文件）。
+
+    progress_queue: 可选，传入 queue.Queue 后，下载过程中会向队列放入进度信息。
+    """
     cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-    result = _transfer_via_api(surl, pwd, cloud_dir)
-    if "error" in result:
-        return {"error": result["error"]}
-    
-    full_path = f"{cloud_dir}/{cloud_path.lstrip('/')}"
-    
-    # 检查路径是否存在
-    out, _, code = _run_bpcs(["ls", "-l", full_path], timeout=60)
-    if code != 0:
-        return {"error": f"云端路径不存在: {cloud_path}"}
-    
-    # 判断是文件还是目录
-    is_dir = False
+    if cloud_path:
+        full_path = f"{cloud_dir}/{cloud_path.strip('/')}"
+        file_name = full_path.rstrip("/").split("/")[-1]
+    else:
+        full_path = cloud_dir
+        file_name = "全部文件"
+
+    logger.info(f"[BaiduPan] download_from_cloud: cloud_path={cloud_path}, full_path={full_path}")
+
+    is_dir = not cloud_path
     file_size = 0
-    for line in out.strip().split("\n"):
-        line = line.strip()
-        if (not line or line.lstrip().startswith("#") or line.startswith("当前")
-                or line.startswith("总") or "Total:" in line or "----" in line):
-            continue
-        parts = line.split()
-        if len(parts) >= 9 and parts[-1] == cloud_path.rstrip("/").split("/")[-1]:
-            if parts[3] == "-":
-                is_dir = True
-            else:
-                try:
-                    raw = parts[3].upper()
-                    if raw.endswith("GB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024 * 1024)
-                    elif raw.endswith("MB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024)
-                    elif raw.endswith("KB"):
-                        file_size = int(float(raw[:-2]) * 1024)
-                    elif raw.endswith("B"):
-                        file_size = int(float(raw[:-1]))
-                    else:
-                        file_size = int(float(raw))
-                except (ValueError, IndexError):
-                    pass
-            break
-    
-    # 检查大小限制（仅对单个文件检查）
+    if cloud_path:
+        # ls 查父目录判断文件/文件夹（bpcs ls -l 查文件本身不显示信息）
+        norm = full_path.rstrip("/")
+        parent = norm.rsplit("/", 1)[0] if "/" in norm else "/"
+        out, _, code = _run_bpcs(["ls", "-l", parent], timeout=60)
+        if code != 0 or "错误" in (out or "") or "不存在" in (out or ""):
+            return {"error": f"路径不存在: {cloud_path}"}
+        found = None
+        for line in out.split("\n"):
+            parsed = _parse_ls_line(line)
+            if parsed and parsed[0] == file_name:
+                found = parsed
+                break
+        if not found:
+            return {"error": f"云端路径不存在: {cloud_path}"}
+        is_dir = found[2]
+        file_size = 0 if is_dir else _parse_size_bytes(found[1])
+    logger.info(f"[BaiduPan] download_from_cloud: is_dir={is_dir}, file_size={file_size} ({file_size/1024/1024:.1f}MB)")
+
+    # 大小限制（仅单文件）
     max_bytes = max_mb * 1024 * 1024
     if not is_dir and max_mb > 0 and file_size > max_bytes:
         return {"error": f"文件过大 ({file_size//1024//1024}MB) 超过 {max_mb}MB 限制"}
-    
+
     # 下载前先检查本地是否已有该文件（避免 BPCS 卡在重复下载）
     if not is_dir:
         account_folder = _get_account_folder()
@@ -870,181 +837,23 @@ def download_share_path(surl: str, pwd: str, cloud_path: str, max_mb: int = 0) -
         dl_timeout = DOWNLOAD_TIMEOUT_SECONDS
     else:
         dl_timeout = max(600, int(file_size / (1024 * 1024) * 15)) if not is_dir else 3600
-    import subprocess as _subprocess
-    # 把文件信息塞进队列，给 handler 监控文件大小用
-    # 如果 file_size 为0但文件非目录，把 0 也塞进去，让 handler 监控时用实际文件大小
-    if progress_queue is not None and not is_dir:
-        progress_queue.put(("_info", file_name, file_size))
-    try:
-        proc = _subprocess.Popen(
-            [BPCS_PATH, "download", full_path, "--ow"],
-            stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
-            stdin=_subprocess.PIPE
-        )
-        proc.stdin.write(b"y\n")
-        proc.stdin.close()
-        if dl_timeout > 0:
-            out = proc.communicate(timeout=dl_timeout)[0]
-        else:
-            out = proc.communicate()[0]
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", errors="replace")
-        code = proc.returncode
-    except _subprocess.TimeoutExpired:
-        logger.error(f"[BaiduPan] download timeout ({dl_timeout}s)")
-        if progress_queue is not None:
-            progress_queue.put(("_error", "下载超时"))
-        return {"error": "下载超时"}
-    except Exception as e:
-        logger.error(f"[BaiduPan] download subprocess error: {e}")
-        return {"error": f"下载进程异常: {e}"}
-    if code != 0 or "失败" in (out or "") or "错误" in (out or ""):
-        logger.error(f"[BaiduPan] download failed: code={code}, out={(out or '')[:200]}")
-        return {"error": "下载失败"}
-    
-    # 查找下载的文件
-    if not DOWNLOAD_DIR:
-        return {"error": "下载目录未设置"}
-    
-    if is_dir:
-        downloaded = []
-        for root, dirs, files in os.walk(DOWNLOAD_DIR):
-            for f in files:
-                fp = os.path.join(root, f)
-                downloaded.append({"path": fp, "name": f, "size": os.path.getsize(fp)})
-        if not downloaded:
-            return {"error": "文件夹下载完成但未找到文件"}
-        return {"path": DOWNLOAD_DIR, "name": cloud_path.rstrip("/").split("/")[-1], "size": 0, "is_dir": True, "files": downloaded}
-    else:
-        name = cloud_path.rstrip("/").split("/")[-1]
-        candidates = [
-            os.path.join(DOWNLOAD_DIR, name),
-            os.path.join(DOWNLOAD_DIR, f"{surl}_{name}"),
-        ]
-        local_path = next((p for p in candidates if os.path.exists(p)), None)
-        if not local_path:
-            for f in os.listdir(DOWNLOAD_DIR):
-                if f == name or f.startswith(surl):
-                    local_path = os.path.join(DOWNLOAD_DIR, f)
-                    break
-        if not local_path or not os.path.exists(local_path):
-            return {"error": "下载完成但未找到文件"}
-        return {"path": local_path, "size": os.path.getsize(local_path), "name": name}
-
-
-
-def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None) -> dict:
-    """从网盘下载指定路径的文件或文件夹（不转存，直接下载已有文件）。
-    
-    progress_queue: 可选，传入 queue.Queue 后，下载过程中会向队列放入进度字符串。
-    """
-    import subprocess as _subprocess
-    cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-    if cloud_path:
-        full_path = f"{cloud_dir}/{cloud_path.lstrip('/')}"
-        file_name = cloud_path.rstrip("/").split("/")[-1]
-    else:
-        full_path = cloud_dir
-        file_name = "全部文件"
-
-    logger.info(f"[BaiduPan] download_from_cloud: cloud_path={cloud_path}, full_path={full_path}")
-    # 检查路径是否存在。bpcs ls -l 查文件本身不显示文件信息，需要查父目录
-    ls_path = full_path
-    ls_file_name = file_name
-    # 如果包含文件名（无"/"结尾），尝试查父目录
-    if not cloud_path.endswith("/"):
-        parent = full_path.rstrip("/").rsplit("/", 1)
-        if len(parent) >= 2:
-            ls_path = parent[0]
-            ls_file_name = parent[1]
-    out, _, code = _run_bpcs(["ls", "-l", ls_path], timeout=60)
-    logger.info(f"[BaiduPan] download_from_cloud: ls_path={ls_path}, ls_file_name={ls_file_name}, code={code}, out_len={len(out or '')}")
-    if code != 0:
-        return {"error": f"路径不存在: {cloud_path}"}
-    if "错误" in (out or "") or "不存在" in (out or ""):
-        return {"error": f"路径不存在或访问失败: {cloud_path}"}
-
-    # 判断是文件还是目录
-    is_dir = False
-    file_size = 0
-    for line in out.strip().split("\n"):
-        line = line.strip()
-        if (not line or line.lstrip().startswith("#") or line.startswith("当前")
-                or line.startswith("总") or "Total:" in line or "----" in line):
-            continue
-        parts = line.split()
-        if len(parts) >= 9 and parts[-1] == ls_file_name:
-            if parts[3] == "-":
-                is_dir = True
-            else:
-                try:
-                    raw = parts[3].upper()
-                    if raw.endswith("GB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024 * 1024)
-                    elif raw.endswith("MB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024)
-                    elif raw.endswith("KB"):
-                        file_size = int(float(raw[:-2]) * 1024)
-                    elif raw.endswith("B"):
-                        file_size = int(float(raw[:-1]))
-                    else:
-                        file_size = int(float(raw))
-                except (ValueError, IndexError):
-                    logger.warning(f"[BaiduPan] download_from_cloud: failed to parse size from parts[3]={parts[3]!r}, raw={raw!r}")
-                    pass
-            break
-    logger.info(f"[BaiduPan] download_from_cloud: is_dir={is_dir}, file_size={file_size} ({file_size/1024/1024:.1f}MB)")
-
-    # 如果还是没解析到大小，且是文件，再试一次：ls 查目录
-    if not is_dir and file_size == 0 and cloud_path.endswith("/") == False:
-        parent_dir = full_path.rstrip("/").rsplit("/", 1)[0] if "/" in full_path.rstrip("/") else full_path
-        search_name = full_path.rstrip("/").split("/")[-1]
-        logger.info(f"[BaiduPan] download_from_cloud: retry ls on parent dir={parent_dir}, search={search_name}")
-        out2, _, _ = _run_bpcs(["ls", "-l", parent_dir], timeout=60)
-        for line in out2.strip().split("\n"):
-            parts = line.split()
-            if len(parts) >= 9 and parts[-1] == search_name and parts[3] != "-":
-                try:
-                    raw = parts[3].upper()
-                    if raw.endswith("GB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024 * 1024)
-                    elif raw.endswith("MB"):
-                        file_size = int(float(raw[:-2]) * 1024 * 1024)
-                    elif raw.endswith("KB"):
-                        file_size = int(float(raw[:-2]) * 1024)
-                    elif raw.endswith("B"):
-                        file_size = int(float(raw[:-1]))
-                    else:
-                        file_size = int(float(raw))
-                except (ValueError, IndexError):
-                    pass
-                break
-        logger.info(f"[BaiduPan] download_from_cloud: retry file_size={file_size} ({file_size/1024/1024:.1f}MB)")
-
-    # 大小限制（仅单文件）
-    max_bytes = max_mb * 1024 * 1024
-    if not is_dir and max_mb > 0 and file_size > max_bytes:
-        return {"error": f"文件过大 ({file_size//1024//1024}MB) 超过 {max_mb}MB 限制"}
-
-    # 下载
-    _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
-    if DOWNLOAD_TIMEOUT_SECONDS > 0:
-        dl_timeout = DOWNLOAD_TIMEOUT_SECONDS
-    else:
-        dl_timeout = max(600, int(file_size / (1024 * 1024) * 15)) if not is_dir else 3600
     logger.info(f"[BaiduPan] download_from_cloud: starting download, dl_timeout={dl_timeout}s, progress_queue={progress_queue is not None}")
     # 把文件信息塞进队列，给 handler 监控文件大小用
     # 如果 file_size 为0但文件非目录，把 0 也塞进去，让 handler 监控时用实际文件大小
     if progress_queue is not None and not is_dir:
         progress_queue.put(("_info", file_name, file_size))
+    started_at = time.time()
     try:
-        proc = _subprocess.Popen(
+        proc = subprocess.Popen(
             [BPCS_PATH, "download", full_path, "--ow"],
-            stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
-            stdin=_subprocess.PIPE
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE
         )
-        proc.stdin.write(b"y\n")
-        proc.stdin.close()
+        try:
+            proc.stdin.write(b"y\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass  # 进程可能已退出，communicate 会给出结果
         if dl_timeout > 0:
             out = proc.communicate(timeout=dl_timeout)[0]
         else:
@@ -1052,8 +861,14 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         if isinstance(out, bytes):
             out = out.decode("utf-8", errors="replace")
         code = proc.returncode
-    except _subprocess.TimeoutExpired:
-        logger.error(f"[BaiduPan] download timeout ({dl_timeout}s)")
+    except subprocess.TimeoutExpired:
+        logger.error(f"[BaiduPan] download timeout ({dl_timeout}s), killing process")
+        # 超时后必须 kill，否则 BPCS 会继续在后台下载
+        proc.kill()
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
         if progress_queue is not None:
             progress_queue.put(("_error", "下载超时"))
         return {"error": "下载超时"}
@@ -1073,12 +888,28 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
     logger.info(f"[BaiduPan] download_from_cloud: searching for downloaded file, DOWNLOAD_DIR={DOWNLOAD_DIR}")
     if is_dir:
         downloaded = []
-        for root, dirs, files in os.walk(DOWNLOAD_DIR):
-            for f in files:
-                fp = os.path.join(root, f)
-                downloaded.append({"path": fp, "name": f, "size": os.path.getsize(fp)})
+
+        def _collect(only_recent: bool):
+            found_files = []
+            for root, _, files in os.walk(DOWNLOAD_DIR):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if only_recent:
+                        try:
+                            if os.path.getctime(fp) < started_at - 120:
+                                continue  # 只收本次下载窗口内新建的文件
+                        except OSError:
+                            continue
+                    found_files.append({"path": fp, "name": f, "size": os.path.getsize(fp)})
+            return found_files
+
+        downloaded = _collect(only_recent=True)
+        if not downloaded:
+            # 兜底：时间过滤没匹配到时退回收集全部
+            downloaded = _collect(only_recent=False)
         if not downloaded:
             return {"error": "文件夹下载完成但未找到文件"}
+        _manifest_add([d["path"] for d in downloaded])
         if _auto_delete_cloud:
             _run_bpcs(["rm", full_path], timeout=30)
         return {"path": DOWNLOAD_DIR, "name": file_name, "size": 0, "is_dir": True, "files": downloaded}
@@ -1101,18 +932,15 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
                     break
         if not local_path or not os.path.exists(local_path):
             return {"error": "下载完成但未找到文件"}
+        _manifest_add([local_path])
         if _auto_delete_cloud:
             _run_bpcs(["rm", full_path], timeout=30)
         return {"path": local_path, "size": os.path.getsize(local_path), "name": file_name}
 
+
 def _get_account_folder() -> str:
     """从 BPCS 配置读取当前登录账号的 uid 和 name，返回账号文件夹名（如 620186943_hitomi999）。"""
-    cfg_path = os.path.join(
-        os.environ.get("BAIDUPCS_GO_CONFIG_DIR", ""),
-        "pcs_config.json"
-    ) if os.environ.get("BAIDUPCS_GO_CONFIG_DIR") else os.path.join(
-        os.path.expanduser("~"), "AppData", "Roaming", "BaiduPCS-Go", "pcs_config.json"
-    )
+    cfg_path = _bpcs_config_path()
     if not os.path.exists(cfg_path):
         return ""
     try:
@@ -1144,41 +972,11 @@ def _get_local_file_size(file_name: str) -> int:
     return 0
 
 
-def _format_size(raw_size: str) -> str:
-    """解析 BPCS ls 输出的文件大小字符串并格式化。"""
-    try:
-        raw = raw_size.upper()
-        if raw.endswith("GB"):
-            return f"{float(raw[:-2]):.2f} GB"
-        elif raw.endswith("MB"):
-            return f"{float(raw[:-2]):.2f} MB"
-        elif raw.endswith("KB"):
-            return f"{float(raw[:-2]):.2f} KB"
-        elif raw.endswith("B"):
-            return f"{float(raw[:-1]):.0f} B"
-        elif raw.endswith("TB"):
-            return f"{float(raw[:-2]):.2f} TB"
-        else:
-            return f"{float(raw):.0f} B"
-    except (ValueError, IndexError):
-        return raw_size
-
-
-async def run_pipeline(surl: str, pwd: str, max_mb: int) -> dict:
-    """Download file. Returns {"path": str, "size": int, "name": str} or {"error": str}"""
-    try:
-        dl = await asyncio.to_thread(download_share, surl, pwd, max_mb)
-        return dl if isinstance(dl, dict) else {"error": "下载失败"}
-    except Exception as e:
-        logger.exception(f"[BaiduPan] pipeline error: {e}")
-        return {"error": f"处理失败: {e}"}
-
-
 @register(
     "astrbot_plugin_baidu_pan",
     "linker9527",
     "百度网盘分享文件自动下载发送",
-    "1.1.0",
+    "1.7.0",
     "https://github.com/linker9527/astrbot_plugin_baidu_pan",
 )
 class BaiduPanPlugin(Star):
@@ -1214,6 +1012,8 @@ class BaiduPanPlugin(Star):
         self._cached_pwd = ""
         self._cached_tree = ""
         self._cached_items = []
+        # 下载去重锁（同一用户同一命令/工具参数只允许一个下载任务）
+        self._active_downloads = set()
 
         # 设置 BaiduPCS-Go 下载目录（exe 可用时才设置）
         if _ensure_bpcs_exe():
@@ -1252,12 +1052,75 @@ class BaiduPanPlugin(Star):
         global _local_cleanup_hour
         cleanup_hour = int(self.config.get("local_cleanup_hour", 3))
         _local_cleanup_hour = cleanup_hour
-        if cleanup_hour >= 0 and cleanup_hour <= 23:
-            _schedule_local_cleanup(cleanup_hour)
-        else:
-            logger.info("[BaiduPan] local auto-cleanup disabled")
+        _schedule_local_cleanup(cleanup_hour)
 
         threading.Thread(target=_init_bpcs, daemon=True).start()
+
+        # 可选：配置了 BDUSS 则启动时自动登录
+        bduss_val = str(self.config.get("bduuss", "")).strip()
+        if bduss_val:
+            threading.Thread(target=self._auto_login_bduss, args=(bduss_val,), daemon=True).start()
+
+    def _auto_login_bduss(self, bduss: str):
+        time.sleep(2)  # 等待 _init_bpcs 先跑完
+        result = login_bduss_bpcs(bduss, "")
+        if "error" in result:
+            logger.warning(f"[BaiduPan] bduuss 配置自动登录失败: {result['error']}")
+        else:
+            logger.info("[BaiduPan] bduuss 配置自动登录成功")
+
+    def _transfer_and_list(self, surl: str, pwd: str) -> dict:
+        """线程安全的"切换分享链接"：清理旧转存 + 转存并列目录 + 更新缓存。
+        锁在同步函数内，配合 asyncio.to_thread 调用不会阻塞事件循环。"""
+        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        with _share_switch_lock:
+            if self._cached_surl and self._cached_surl != surl:
+                _run_bpcs(["rm", cloud_dir], timeout=30)
+            result = list_share_content(surl, pwd)
+            if "error" not in result:
+                self._cached_surl = surl
+                self._cached_pwd = pwd
+                self._cached_tree = result.get("text", "")
+                self._cached_items = result.get("items", [])
+        return result
+
+    def _check_switch_allowed(self, surl: str) -> str:
+        """切换到新链接前检查是否有下载正在进行（避免删掉正在下载的转存文件）。"""
+        if surl and self._cached_surl != surl and self._active_downloads:
+            return "⏳ 当前有下载任务进行中，请稍后再查看其他链接"
+        return ""
+
+    @staticmethod
+    def _normalize_link(link: str, pwd: str) -> tuple:
+        """把用户输入的链接/surl 规范化为 (surl, pwd)。支持：
+        完整链接(含?pwd=)、裸surl、裸surl + 提取码(空格分隔或"提取码:"前缀)。"""
+        link = (link or "").strip()
+        if link.startswith(("http", "pan.baidu.com", "yun.baidu.com")):
+            if not link.startswith("http"):
+                link = "https://" + link
+            surl, p2 = parse_share_link(link)
+            return surl, (p2 or pwd)
+        # 裸 surl：取第一段，剩余部分尝试提取密码
+        seg = link.split(None, 1)
+        surl = seg[0]
+        rest = seg[1].strip() if len(seg) > 1 else ""
+        if not pwd and rest:
+            m = re.search(r'(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})', rest, re.IGNORECASE)
+            if m:
+                pwd = m.group(1)
+            else:
+                first = rest.split()[0]
+                if re.fullmatch(r'[A-Za-z0-9]{4,6}', first):
+                    pwd = first
+        return surl, pwd
+
+    @staticmethod
+    async def _interruptible_sleep(fut: asyncio.Future, seconds: int):
+        """分段休眠，长间隔下也能及时感知下载完成。"""
+        for _ in range(max(1, int(seconds))):
+            if fut.done():
+                return
+            await asyncio.sleep(1)
 
     def _is_blacklisted(self, event: AstrMessageEvent) -> bool:
         if self._get_send_mode() != "onebot":
@@ -1275,7 +1138,7 @@ class BaiduPanPlugin(Star):
     def _get_send_mode(self) -> str:
         return str(self.config.get("send_mode", "onebot")).strip().lower()
 
-    async def _send_file(self, event: AstrMessageEvent, dl: dict, share_url: str = ""):
+    async def _send_file(self, event: AstrMessageEvent, dl: dict, share_url: str = "") -> bool:
         """根据平台类型和文件大小选择发送方式。"""
         file_path = dl["path"]
         file_size = dl["size"]
@@ -1295,62 +1158,67 @@ class BaiduPanPlugin(Star):
         logger.info(f"[BaiduPan] _send_file: send_mode={send_mode}")
         if send_mode == "official":
             return await self._send_official(event, file_path, name, size_mb, share_url)
-        elif send_mode == "onebot":
-            ret = await self._send_onebot(event, file_path, name, size_mb, share_url)
-            if ret:
-                return ret
-            return
         elif send_mode == "other":
             return await self._send_other(event, file_path, name, size_mb, share_url)
-        else:
-            ret = await self._send_onebot(event, file_path, name, size_mb, share_url)
-            if ret:
-                return ret
-            return
+        else:  # onebot 及默认
+            return await self._send_onebot(event, file_path, name, size_mb, share_url)
 
-    async def _send_onebot(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = ""):
-        """OneBot / napcat 路径：直接发送文件，失败则返回链接"""
+    async def _send_onebot(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
+        """OneBot / napcat 路径：直接发送文件，失败则发送链接"""
         logger.info(f"[BaiduPan] _send_onebot: name={name}, size={size_mb:.1f}MB")
         try:
-            event.chain_result([File(name=name, file=file_path)])
+            await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
             logger.info(f"[BaiduPan] _send_onebot: direct send success")
-            return event
+            return True
         except Exception as e2:
             logger.warning(f"[BaiduPan] _send_onebot: direct send failed: {e2}")
-            # 兜底：返回链接
+            # 兜底：发送链接
             msg = f"⚠️ 文件 {size_mb:.1f}MB 发送失败"
             if share_url:
                 msg += f"。请自行下载: {share_url}"
-            event.chain_result(msg)
-            return event
+            try:
+                await event.send(MessageChain(chain=[Plain(msg)]))
+            except Exception:
+                pass
+            return False
 
-    async def _send_other(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = ""):
-        """其他平台路径：直接发送文件，失败则返回链接"""
+    async def _send_other(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
+        """其他平台路径：直接发送文件，失败则发送链接"""
         try:
-            event.chain_result([File(name=name, file=file_path)])
-            return event
+            await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
+            return True
         except Exception as e:
             logger.warning(f"[BaiduPan] send file failed: {e}")
             msg = "⚠️ 文件发送失败"
             if share_url:
                 msg += f"，请自行下载: {share_url}"
-            event.chain_result(msg)
-            return event
+            try:
+                await event.send(MessageChain(chain=[Plain(msg)]))
+            except Exception:
+                pass
+            return False
 
-    async def _send_official(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = ""):
+    async def _send_official(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
         """QQ官方机器人路径：<=200MB 走官方API上传，>200MB 只能返回链接"""
         logger.info(f"[BaiduPan] _send_official: name={name}, size={size_mb:.1f}MB, limit={FLASH_TASK_LIMIT_MB}MB")
         if size_mb <= FLASH_TASK_LIMIT_MB:
             logger.info(f"[BaiduPan] _send_official: file <= limit, sending directly")
-            event.chain_result([File(name=name, file=file_path)])
-            return event
+            try:
+                await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
+                return True
+            except Exception as e:
+                logger.warning(f"[BaiduPan] _send_official: send failed: {e}")
+                return False
 
         logger.info(f"[BaiduPan] _send_official: file > limit, returning link")
         msg = "⚠️ 文件超过200MB，QQ官方API暂不支持大文件上传"
         if share_url:
             msg += f"，请自行下载: {share_url}"
-        event.chain_result(msg)
-        return event
+        try:
+            await event.send(MessageChain(chain=[Plain(msg)]))
+        except Exception:
+            pass
+        return False
 
     @filter.llm_tool(name="pan_list")
     async def pan_list(self, event: AstrMessageEvent, link: str, pwd: str = ""):
@@ -1361,46 +1229,24 @@ class BaiduPanPlugin(Star):
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
-            return
-        surl = ""
-        if link.startswith("http") or link.startswith("pan.baidu.com") or link.startswith("yun.baidu.com"):
-            if not link.startswith("http"):
-                link = "https://" + link
-            surl, p2 = parse_share_link(link)
-            pwd = p2 or pwd
-        else:
-            surl = link
+            return "你没有权限使用该功能。"
+        surl, pwd = self._normalize_link(link, pwd)
 
         if not surl:
             return "无法解析链接"
 
-        # 新链接时清理旧转存目录
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-        if self._cached_surl and self._cached_surl != surl:
-            _run_bpcs(["rm", cloud_dir], timeout=30)
+        blocked = self._check_switch_allowed(surl)
+        if blocked:
+            return blocked
 
-        result = await asyncio.to_thread(list_share_content, surl, pwd)
+        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
         if "error" in result:
             return result["error"]
-
-        # 缓存
-        self._cached_surl = surl
-        self._cached_pwd = pwd
-        self._cached_tree = result["text"]
-        self._cached_items = result.get("items", [])
-
         return result["text"]
 
     @filter.llm_tool(name="pan_download_dir")
     async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = ""):
-        """下载百度网盘分享中的文件夹（含所有内容）。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"时调用。如果之前已查看过目录树，LLM应从树中找到完整路径。下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件夹名>/...（如 E:\\downloads\\620186943_hitomi999\\大气层包\\...），回复用户时把实际保存路径一起告诉用户。
-
-        self._active_downloads = getattr(self, "_active_downloads", set())
-        dl_key = f"tool:pan_download_dir:{event.get_sender_id()}"
-        if dl_key in self._active_downloads:
-                logger.warning(f"[BaiduPan] pan_download_dir: duplicate blocked: {dl_key}")
-                return "⏳ 该文件正在下载中，请稍候..."
-        self._active_downloads.add(dl_key)
+        """下载百度网盘分享中的文件夹（含所有内容）。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"时调用。如果之前已查看过目录树，LLM应从树中找到完整路径。下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件夹名>/...，回复用户时把实际保存路径一起告诉用户。
 
         Args:
             folder_path(string): 文件夹路径，如 "大气层包" 或 "大气层包/子文件夹"，不含顶层目录名
@@ -1408,135 +1254,125 @@ class BaiduPanPlugin(Star):
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
-            return
+            return "你没有权限使用该功能。"
 
         surl = ""
         if link:
-            if link.startswith("http") or link.startswith("pan.baidu.com") or link.startswith("yun.baidu.com"):
-                if not link.startswith("http"):
-                    link = "https://" + link
-                surl, p2 = parse_share_link(link)
-                pwd = p2 or pwd
-            else:
-                surl = link
+            surl, pwd = self._normalize_link(link, pwd)
 
         if surl:
-            # 新链接，先转存
-            cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-            if self._cached_surl and self._cached_surl != surl:
-                _run_bpcs(["rm", cloud_dir], timeout=30)
-            result = await asyncio.to_thread(list_share_content, surl, pwd)
+            blocked = self._check_switch_allowed(surl)
+            if blocked:
+                return blocked
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
             if "error" in result:
                 return result["error"]
-            self._cached_surl = surl
-            self._cached_pwd = pwd
-            self._cached_tree = result["text"]
-            self._cached_items = result.get("items", [])
         elif not self._cached_surl:
             return "请先查看目录: /pan <链接> [密码]"
 
-        prog_q = queue.Queue() if self._progress_enabled else None
-        dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, folder_path, self._get_max_mb(), prog_q))
-        if prog_q:
-            file_info = None
-            _last_prog_size = None
-            _last_prog_time = None
-            while not dl_future.done():
-                try:
-                    msg = prog_q.get_nowait()
-                    if isinstance(msg, tuple) and msg[0] == "_info":
-                        file_info = (msg[1], msg[2])
-                    elif isinstance(msg, tuple) and msg[0] == "_error":
-                        event.plain_result(f"❌ {msg[1]}")
-                    else:
-                        event.plain_result(msg)
-                except queue.Empty:
-                    pass
-                if file_info and not dl_future.done():
-                    fname, total = file_info
-                    current = _get_local_file_size(fname)
-                    if current > 0 and total > 0:
-                        pct = min(current / total * 100, 99.9)
-                        event.plain_result(f"⏬ 下载中: {pct:.1f}%")
-                await asyncio.sleep(self._progress_interval)
-        dl = await dl_future
-        if "error" in dl:
-            return dl["error"]
+        dl_key = f"tool:pan_download_dir:{event.get_sender_id()}:{folder_path}"
+        if dl_key in self._active_downloads:
+            logger.warning(f"[BaiduPan] pan_download_dir: duplicate blocked: {dl_key}")
+            return "⏳ 该文件正在下载中，请稍候..."
+        self._active_downloads.add(dl_key)
+        try:
+            prog_q = queue.Queue() if self._progress_enabled else None
+            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, folder_path, self._get_max_mb(), prog_q))
+            if prog_q:
+                file_info = None
+                _last_prog_size = None
+                _last_prog_time = None
+                while not dl_future.done():
+                    try:
+                        msg = prog_q.get_nowait()
+                        if isinstance(msg, tuple) and msg[0] == "_info":
+                            file_info = (msg[1], msg[2])
+                        elif isinstance(msg, tuple) and msg[0] == "_error":
+                            await event.send(event.plain_result(f"❌ {msg[1]}"))
+                        elif isinstance(msg, str):
+                            await event.send(event.plain_result(msg))
+                    except queue.Empty:
+                        pass
+                    if file_info and not dl_future.done():
+                        fname, total = file_info
+                        current = _get_local_file_size(fname)
+                        if current > 0 and total > 0:
+                            pct = min(current / total * 100, 99.9)
+                            await event.send(event.plain_result(f"⏬ 下载中: {pct:.1f}%"))
+                    await self._interruptible_sleep(dl_future, self._progress_interval)
+            dl = await dl_future
+            if "error" in dl:
+                return dl["error"]
 
-        if dl.get("is_dir"):
-            file_count = len(dl.get("files", []))
-            event.plain_result(f"✅ 文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件")
-            event.plain_result(f"📁 保存路径: {dl['path']}")
-            return f"文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
-        else:
-            share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
-            await self._send_file(event, dl, share_url)
-            return f"文件 '{folder_path}' 下载并发送完成"
+            if dl.get("is_dir"):
+                file_count = len(dl.get("files", []))
+                await event.send(event.plain_result(f"✅ 文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件"))
+                await event.send(event.plain_result(f"📁 保存路径: {dl['path']}"))
+                return f"文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
+            else:
+                share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                sent = await self._send_file(event, dl, share_url)
+                if sent:
+                    return f"文件 '{folder_path}' 下载并发送完成"
+                return f"文件 '{folder_path}' 已下载到 {dl['path']}，但发送失败"
+        finally:
+            self._active_downloads.discard(dl_key)
 
     @filter.llm_tool(name="pan_download_all")
     async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = ""):
         """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件名>（如 E:\\downloads\\620186943_hitomi999\\xxx.zip），回复用户时把实际保存路径一起告诉用户。
-
-        self._active_downloads = getattr(self, "_active_downloads", set())
-        dl_key = f"tool:pan_download_all:{event.get_sender_id()}"
-        if dl_key in self._active_downloads:
-                logger.warning(f"[BaiduPan] pan_download_all: duplicate blocked: {dl_key}")
-                return "⏳ 该文件正在下载中，请稍候..."
-        self._active_downloads.add(dl_key)
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
-            return
+            return "你没有权限使用该功能。"
 
         surl = ""
         if link:
-            if link.startswith("http") or link.startswith("pan.baidu.com") or link.startswith("yun.baidu.com"):
-                if not link.startswith("http"):
-                    link = "https://" + link
-                surl, p2 = parse_share_link(link)
-                pwd = p2 or pwd
-            else:
-                surl = link
+            surl, pwd = self._normalize_link(link, pwd)
 
         if surl:
-            cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-            if self._cached_surl and self._cached_surl != surl:
-                _run_bpcs(["rm", cloud_dir], timeout=30)
-            result = await asyncio.to_thread(list_share_content, surl, pwd)
+            blocked = self._check_switch_allowed(surl)
+            if blocked:
+                return blocked
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
             if "error" in result:
                 return result["error"]
-            self._cached_surl = surl
-            self._cached_pwd = pwd
-            self._cached_tree = result["text"]
-            self._cached_items = result.get("items", [])
         elif not self._cached_surl:
             return "请先查看目录: /pan <链接> [密码]"
 
-        # 下载整个转存目录
-        prog_q = queue.Queue() if self._progress_enabled else None
-        dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, "", self._get_max_mb(), prog_q))
-        if prog_q:
-            while not dl_future.done():
-                try:
-                    msg = prog_q.get_nowait()
-                    if isinstance(msg, tuple) and msg[0] == "_error":
-                        event.plain_result(f"❌ {msg[1]}")
-                    else:
-                        event.plain_result(msg)
-                except queue.Empty:
-                    pass
-                await asyncio.sleep(self._progress_interval)
-        dl = await dl_future
-        if "error" in dl:
-            return dl["error"]
+        dl_key = f"tool:pan_download_all:{event.get_sender_id()}"
+        if dl_key in self._active_downloads:
+            logger.warning(f"[BaiduPan] pan_download_all: duplicate blocked: {dl_key}")
+            return "⏳ 该文件正在下载中，请稍候..."
+        self._active_downloads.add(dl_key)
+        try:
+            # 下载整个转存目录
+            prog_q = queue.Queue() if self._progress_enabled else None
+            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, "", self._get_max_mb(), prog_q))
+            if prog_q:
+                while not dl_future.done():
+                    try:
+                        msg = prog_q.get_nowait()
+                        if isinstance(msg, tuple) and msg[0] == "_error":
+                            await event.send(event.plain_result(f"❌ {msg[1]}"))
+                        elif isinstance(msg, str):
+                            await event.send(event.plain_result(msg))
+                    except queue.Empty:
+                        pass
+                    await self._interruptible_sleep(dl_future, self._progress_interval)
+            dl = await dl_future
+            if "error" in dl:
+                return dl["error"]
 
-        file_count = len(dl.get("files", []))
-        event.plain_result(f"✅ 全部文件下载完成，共 {file_count} 个文件")
-        event.plain_result(f"📁 保存路径: {dl['path']}")
-        return f"全部文件下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
+            file_count = len(dl.get("files", []))
+            await event.send(event.plain_result(f"✅ 全部文件下载完成，共 {file_count} 个文件"))
+            await event.send(event.plain_result(f"📁 保存路径: {dl['path']}"))
+            return f"全部文件下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
+        finally:
+            self._active_downloads.discard(dl_key)
 
     async def _login_flow(self, event: AstrMessageEvent, username: str, password: str):
         """/pan login 子命令：账密登录，全局生效"""
@@ -1556,10 +1392,7 @@ class BaiduPanPlugin(Star):
 
         if self._is_blacklisted(event):
             return
-        # 下载锁：只对 dir/file 下载操作生效，非下载操作不锁
-        self._active_downloads = getattr(self, '_active_downloads', set())
         dl_key = f"{event.get_sender_id()}:{str(args).strip()}"
-        # 延迟到 dir/file 分支才加锁，避免 help/look 等操作被锁
         _lock_acquired = False
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
@@ -1640,8 +1473,10 @@ class BaiduPanPlugin(Star):
             if len(parts) < 2 or len(parts[1]) < 50:
                 yield event.plain_result("用法: /pan cookies <完整Cookies字符串>（浏览器登录 pan.baidu.com 后 F12 → Network → 任意请求 → 复制 Cookie 请求头）")
                 return
+            # Cookies 字符串本身不含空格分隔的多段，用原始参数拼接，避免被空格截断
+            cookie_str = " ".join(parts[1:])
             yield event.plain_result("⏳ 正在注入 Cookies...")
-            result = await asyncio.to_thread(login_cookies_bpcs, parts[1])
+            result = await asyncio.to_thread(login_cookies_bpcs, cookie_str)
             if "error" in result:
                 yield event.plain_result(f"❌ {result['error']}")
             else:
@@ -1664,9 +1499,7 @@ class BaiduPanPlugin(Star):
             return
 
         if parts[0] == "qrlogin":
-            import requests as req
-            import json as _json
-            sess = req.Session()
+            sess = _req.Session()
             sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
             # Step 1: 获取二维码（session 会自动保存 BAIDUID 等初始 cookie）
             try:
@@ -1743,51 +1576,49 @@ class BaiduPanPlugin(Star):
                     continue
                 v = cv.get("v", "")
                 if v:
-                        # Step 3: 用 v 换取登录凭证（session 自动带上之前累积的 cookie）
-                        login_url = (
-                            f"https://passport.baidu.com/v3/login/main/qrbdusslogin"
-                            f"?bduss={v}&u=&loginVersion=v4&qrcode=1&tpl=mm&apiver=v3"
+                    # Step 3: 用 v 换取登录凭证（session 自动带上之前累积的 cookie）
+                    login_url = (
+                        f"https://passport.baidu.com/v3/login/main/qrbdusslogin"
+                        f"?bduss={v}&u=&loginVersion=v4&qrcode=1&tpl=mm&apiver=v3"
+                    )
+                    try:
+                        lr = await asyncio.to_thread(
+                            lambda: sess.get(login_url, timeout=10, allow_redirects=False)
                         )
-                        try:
-                            lr = await asyncio.to_thread(
-                                lambda: sess.get(login_url, timeout=10, allow_redirects=False)
-                            )
-                        except Exception as e:
-                            yield event.plain_result(f"❌ 获取凭证失败: {e}")
-                            return
-                        # 从 session 的 cookie jar 提取全部 cookie（已自动解析）
-                        full_cookie = "; ".join(f"{k}={v}" for k, v in sess.cookies.items())
-                        # 访问 pan.baidu.com 获取 pan 专用 cookie（csrfToken / PANPSC）
-                        try:
-                            await asyncio.to_thread(
-                                lambda: sess.get("https://pan.baidu.com/disk/main", timeout=10)
-                            )
-                        except Exception:
-                            pass
-                        # 重新提取完整 cookie（含 pan 专用 cookie）
-                        full_cookie = "; ".join(f"{k}={v}" for k, v in sess.cookies.items())
-                        logger.info(f"[BaiduPan] qrlogin cookie keys: {list(sess.cookies.keys())}")
-                        logger.info(f"[BaiduPan] qrlogin full_cookie len: {len(full_cookie)}")
-                        bduss_m = re.search(r'BDUSS=([^\s;]+)', full_cookie)
-                        if not bduss_m:
-                            yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
-                            return
-                        # Step 4: 用完整 cookie 登录 BaiduPCS-Go
-                        result = await asyncio.to_thread(login_cookies_bpcs, full_cookie)
-                        if "error" in result:
-                            # 回退到仅 BDUSS+STOKEN 方式
-                            stoken_m = re.search(r'STOKEN=([^\s;]+)', full_cookie)
-                            bduss_val = bduss_m.group(1)
-                            stoken_val = stoken_m.group(1) if stoken_m else ""
-                            result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val)
-                            if "error" in result2:
-                                yield event.plain_result(f"❌ {result2['error']}")
-                            else:
-                                extra = "（含STOKEN，转存可能受限）" if stoken_val else "（无STOKEN）"
-                                yield event.plain_result(f"✅ 扫码登录成功！{extra}")
-                        else:
-                            yield event.plain_result("✅ 扫码登录成功！（完整cookie，转存可用）")
+                    except Exception as e:
+                        yield event.plain_result(f"❌ 获取凭证失败: {e}")
                         return
+                    # 访问 pan.baidu.com 获取 pan 专用 cookie（csrfToken / PANPSC）
+                    try:
+                        await asyncio.to_thread(
+                            lambda: sess.get("https://pan.baidu.com/disk/main", timeout=10)
+                        )
+                    except Exception:
+                        pass
+                    # 从 session 的 cookie jar 提取全部 cookie（已含 pan 专用 cookie）
+                    full_cookie = "; ".join(f"{k}={cv2}" for k, cv2 in sess.cookies.items())
+                    logger.info(f"[BaiduPan] qrlogin cookie keys: {list(sess.cookies.keys())}")
+                    logger.info(f"[BaiduPan] qrlogin full_cookie len: {len(full_cookie)}")
+                    bduss_m = re.search(r'BDUSS=([^\s;]+)', full_cookie)
+                    if not bduss_m:
+                        yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
+                        return
+                    # Step 4: 用完整 cookie 登录 BaiduPCS-Go
+                    result = await asyncio.to_thread(login_cookies_bpcs, full_cookie)
+                    if "error" in result:
+                        # 回退到仅 BDUSS+STOKEN 方式
+                        stoken_m = re.search(r'STOKEN=([^\s;]+)', full_cookie)
+                        bduss_val = bduss_m.group(1)
+                        stoken_val = stoken_m.group(1) if stoken_m else ""
+                        result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val)
+                        if "error" in result2:
+                            yield event.plain_result(f"❌ {result2['error']}")
+                        else:
+                            extra = "（含STOKEN，转存可能受限）" if stoken_val else "（无STOKEN）"
+                            yield event.plain_result(f"✅ 扫码登录成功！{extra}")
+                    else:
+                        yield event.plain_result("✅ 扫码登录成功！（完整cookie，转存可用）")
+                    return
             yield event.plain_result("❌ 二维码已超时，请重新发送 /pan qrlogin")
             return
 
@@ -1799,7 +1630,8 @@ class BaiduPanPlugin(Star):
             if len(parts) < 2:
                 yield event.plain_result("用法: /pan dir <文件夹路径>")
                 return
-            dir_path = parts[1]
+            # 路径可能含空格，拼回完整参数
+            dir_path = " ".join(parts[1:])
             # 下载锁检查
             if dl_key in self._active_downloads:
                 logger.warning(f"[BaiduPan] on_pan: duplicate download blocked: {dl_key}")
@@ -1807,71 +1639,74 @@ class BaiduPanPlugin(Star):
                 return
             self._active_downloads.add(dl_key)
             _lock_acquired = True
-            logger.info(f"[BaiduPan] on_pan dir: dir_path={dir_path}, progress_enabled={self._progress_enabled}")
-            yield event.plain_result(f"⏳ 正在下载文件夹: {dir_path} ...")
-            prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, dir_path, self._get_max_mb(), prog_q))
-            if prog_q:
-                file_info = None
-                _last_prog_size = None
-                _last_prog_time = None
-                while not dl_future.done():
-                    try:
-                        msg = prog_q.get_nowait()
-                        if isinstance(msg, tuple) and msg[0] == "_info":
-                            file_info = (msg[1], msg[2])  # (name, size)
-                        elif isinstance(msg, tuple) and msg[0] == "_error":
-                            yield event.plain_result(f"❌ {msg[1]}")
-                        else:
-                            yield event.plain_result(msg)
-                    except queue.Empty:
-                        pass
-                    # 监控本地文件大小
-                    if file_info and not dl_future.done():
-                        fname, total = file_info
-                        current = _get_local_file_size(fname)
-                        # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
-                        if total <= 0 and current > 0:
-                            total = current
-                            file_info = (fname, total)
-                        if current > 0 and total > 0:
-                            now = time.time()
-                            if _last_prog_time is None or now - _last_prog_time >= 1.0:
-                                if _last_prog_size is not None and _last_prog_time is not None:
-                                    dt = now - _last_prog_time
-                                    if dt > 0:
-                                        speed_bps = (current - _last_prog_size) / dt
-                                        speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
-                                        remain = (total - current) / speed_bps if speed_bps > 0 else 0
-                                        if remain >= 3600:
-                                            eta = f"{remain/3600:.1f}h"
-                                        elif remain >= 60:
-                                            eta = f"{remain/60:.1f}m"
-                                        else:
-                                            eta = f"{remain:.0f}s"
+            try:
+                logger.info(f"[BaiduPan] on_pan dir: dir_path={dir_path}, progress_enabled={self._progress_enabled}")
+                yield event.plain_result(f"⏳ 正在下载文件夹: {dir_path} ...")
+                prog_q = queue.Queue() if self._progress_enabled else None
+                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, dir_path, self._get_max_mb(), prog_q))
+                if prog_q:
+                    file_info = None
+                    _last_prog_size = None
+                    _last_prog_time = None
+                    while not dl_future.done():
+                        try:
+                            msg = prog_q.get_nowait()
+                            if isinstance(msg, tuple) and msg[0] == "_info":
+                                file_info = (msg[1], msg[2])  # (name, size)
+                            elif isinstance(msg, tuple) and msg[0] == "_error":
+                                yield event.plain_result(f"❌ {msg[1]}")
+                            elif isinstance(msg, str):
+                                yield event.plain_result(msg)
+                        except queue.Empty:
+                            pass
+                        # 监控本地文件大小
+                        if file_info and not dl_future.done():
+                            fname, total = file_info
+                            current = _get_local_file_size(fname)
+                            # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
+                            if total <= 0 and current > 0:
+                                total = current
+                                file_info = (fname, total)
+                            if current > 0 and total > 0:
+                                now = time.time()
+                                if _last_prog_time is None or now - _last_prog_time >= 1.0:
+                                    if _last_prog_size is not None and _last_prog_time is not None:
+                                        dt = now - _last_prog_time
+                                        if dt > 0:
+                                            speed_bps = (current - _last_prog_size) / dt
+                                            speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
+                                            remain = (total - current) / speed_bps if speed_bps > 0 else 0
+                                            if remain >= 3600:
+                                                eta = f"{remain/3600:.1f}h"
+                                            elif remain >= 60:
+                                                eta = f"{remain/60:.1f}m"
+                                            else:
+                                                eta = f"{remain:.0f}s"
+                                            _last_prog_size = current
+                                            _last_prog_time = now
+                                            pct = min(current / total * 100, 100.0)
+                                            yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
+                                            if current >= total:
+                                                yield event.plain_result("✅ 下载完成，正在发送...")
+                                                break
+                                    else:
                                         _last_prog_size = current
                                         _last_prog_time = now
-                                        pct = min(current / total * 100, 100.0)
-                                        yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
-                                        if current >= total:
-                                            yield event.plain_result("✅ 下载完成，正在发送...")
-                                            break
-                                else:
-                                    _last_prog_size = current
-                                    _last_prog_time = now
-                    await asyncio.sleep(self._progress_interval)
-            dl = await dl_future
-            logger.info(f"[BaiduPan] on_pan dir: download complete, dl={dl}")
-            if "error" in dl:
-                logger.error(f"[BaiduPan] on_pan dir: download error: {dl['error']}")
-                yield event.plain_result(f"❌ {dl['error']}")
-            else:
-                if dl.get("is_dir"):
-                    yield event.plain_result(f"✅ 文件夹 '{dir_path}' 下载完成，共 {len(dl.get('files', []))} 个文件")
-                    yield event.plain_result(f"📁 保存路径: {dl['path']}")
+                        await self._interruptible_sleep(dl_future, self._progress_interval)
+                dl = await dl_future
+                logger.info(f"[BaiduPan] on_pan dir: download complete, dl={dl}")
+                if "error" in dl:
+                    logger.error(f"[BaiduPan] on_pan dir: download error: {dl['error']}")
+                    yield event.plain_result(f"❌ {dl['error']}")
                 else:
-                    yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
-            if _lock_acquired: self._active_downloads.discard(dl_key)
+                    if dl.get("is_dir"):
+                        yield event.plain_result(f"✅ 文件夹 '{dir_path}' 下载完成，共 {len(dl.get('files', []))} 个文件")
+                        yield event.plain_result(f"📁 保存路径: {dl['path']}")
+                    else:
+                        yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
+            finally:
+                if _lock_acquired:
+                    self._active_downloads.discard(dl_key)
             return
 
         if parts[0] in ("file", "f"):
@@ -1882,7 +1717,8 @@ class BaiduPanPlugin(Star):
             if len(parts) < 2:
                 yield event.plain_result("用法: /pan file <文件路径>")
                 return
-            f_path = parts[1]
+            # 路径可能含空格，拼回完整参数
+            f_path = " ".join(parts[1:])
             # 下载操作才加锁
             if dl_key in self._active_downloads:
                 logger.warning(f"[BaiduPan] on_pan: duplicate download blocked: {dl_key}")
@@ -1890,97 +1726,87 @@ class BaiduPanPlugin(Star):
                 return
             self._active_downloads.add(dl_key)
             _lock_acquired = True
-            logger.info(f"[BaiduPan] on_pan file: f_path={f_path}, progress_enabled={self._progress_enabled}")
-            yield event.plain_result(f"⏳ 正在下载文件: {f_path} ...")
-            prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, f_path, self._get_max_mb(), prog_q))
-            if prog_q:
-                file_info = None
-                _last_prog_size = None
-                _last_prog_time = None
-                while not dl_future.done():
-                    try:
-                        msg = prog_q.get_nowait()
-                        if isinstance(msg, tuple) and msg[0] == "_info":
-                            file_info = (msg[1], msg[2])
-                        elif isinstance(msg, tuple) and msg[0] == "_error":
-                            yield event.plain_result(f"❌ {msg[1]}")
-                        else:
-                            yield event.plain_result(msg)
-                    except queue.Empty:
-                        pass
-                    if file_info and not dl_future.done():
-                        fname, total = file_info
-                        current = _get_local_file_size(fname)
-                        # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
-                        if total <= 0 and current > 0:
-                            total = current
-                            file_info = (fname, total)
-                        if current > 0 and total > 0:
-                            now = time.time()
-                            if _last_prog_time is None or now - _last_prog_time >= 1.0:
-                                if _last_prog_size is not None and _last_prog_time is not None:
-                                    dt = now - _last_prog_time
-                                    if dt > 0:
-                                        speed_bps = (current - _last_prog_size) / dt
-                                        speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
-                                        remain = (total - current) / speed_bps if speed_bps > 0 else 0
-                                        if remain >= 3600:
-                                            eta = f"{remain/3600:.1f}h"
-                                        elif remain >= 60:
-                                            eta = f"{remain/60:.1f}m"
-                                        else:
-                                            eta = f"{remain:.0f}s"
+            try:
+                logger.info(f"[BaiduPan] on_pan file: f_path={f_path}, progress_enabled={self._progress_enabled}")
+                yield event.plain_result(f"⏳ 正在下载文件: {f_path} ...")
+                prog_q = queue.Queue() if self._progress_enabled else None
+                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, f_path, self._get_max_mb(), prog_q))
+                if prog_q:
+                    file_info = None
+                    _last_prog_size = None
+                    _last_prog_time = None
+                    while not dl_future.done():
+                        try:
+                            msg = prog_q.get_nowait()
+                            if isinstance(msg, tuple) and msg[0] == "_info":
+                                file_info = (msg[1], msg[2])
+                            elif isinstance(msg, tuple) and msg[0] == "_error":
+                                yield event.plain_result(f"❌ {msg[1]}")
+                            elif isinstance(msg, str):
+                                yield event.plain_result(msg)
+                        except queue.Empty:
+                            pass
+                        if file_info and not dl_future.done():
+                            fname, total = file_info
+                            current = _get_local_file_size(fname)
+                            # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
+                            if total <= 0 and current > 0:
+                                total = current
+                                file_info = (fname, total)
+                            if current > 0 and total > 0:
+                                now = time.time()
+                                if _last_prog_time is None or now - _last_prog_time >= 1.0:
+                                    if _last_prog_size is not None and _last_prog_time is not None:
+                                        dt = now - _last_prog_time
+                                        if dt > 0:
+                                            speed_bps = (current - _last_prog_size) / dt
+                                            speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
+                                            remain = (total - current) / speed_bps if speed_bps > 0 else 0
+                                            if remain >= 3600:
+                                                eta = f"{remain/3600:.1f}h"
+                                            elif remain >= 60:
+                                                eta = f"{remain/60:.1f}m"
+                                            else:
+                                                eta = f"{remain:.0f}s"
+                                            _last_prog_size = current
+                                            _last_prog_time = now
+                                            pct = min(current / total * 100, 100.0)
+                                            yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
+                                            if current >= total:
+                                                yield event.plain_result("✅ 下载完成，正在发送...")
+                                                break
+                                    else:
                                         _last_prog_size = current
                                         _last_prog_time = now
-                                        pct = min(current / total * 100, 100.0)
-                                        yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
-                                        if current >= total:
-                                            yield event.plain_result("✅ 下载完成，正在发送...")
-                                            break
-                                else:
-                                    _last_prog_size = current
-                                    _last_prog_time = now
-                    await asyncio.sleep(self._progress_interval)
-            dl = await dl_future
-            logger.info(f"[BaiduPan] on_pan file: download complete, dl={dl}")
-            if "error" in dl:
-                logger.error(f"[BaiduPan] on_pan file: download error: {dl['error']}")
-                yield event.plain_result(f"❌ {dl['error']}")
-            else:
-                logger.info(f"[BaiduPan] on_pan file: download complete, path={dl.get('path')}")
-                yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
-            if _lock_acquired: self._active_downloads.discard(dl_key)
+                        await self._interruptible_sleep(dl_future, self._progress_interval)
+                dl = await dl_future
+                logger.info(f"[BaiduPan] on_pan file: download complete, dl={dl}")
+                if "error" in dl:
+                    logger.error(f"[BaiduPan] on_pan file: download error: {dl['error']}")
+                    yield event.plain_result(f"❌ {dl['error']}")
+                else:
+                    logger.info(f"[BaiduPan] on_pan file: download complete, path={dl.get('path')}")
+                    yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
+            finally:
+                if _lock_acquired:
+                    self._active_downloads.discard(dl_key)
             return
 
-        # 默认: /pan <链接> [密码] → 转存并展示目录树
-        link = parts[0]
-        pwd = parts[1] if len(parts) > 1 else ""
-        surl = ""
-        if link.startswith("http") or link.startswith("pan.baidu.com") or link.startswith("yun.baidu.com"):
-            if not link.startswith("http"):
-                link = "https://" + link
-            surl, p2 = parse_share_link(link)
-            pwd = p2 or pwd
-        else:
-            surl = link
+        # 默认: /pan <链接> [密码] → 转存并展示目录树（整串交给 _normalize_link 统一解析）
+        surl, pwd = self._normalize_link(" ".join(parts), "")
 
         if not surl:
             yield event.plain_result("❌ 无法解析链接")
             return
 
-        # 新链接时清理旧转存目录
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-        if self._cached_surl and self._cached_surl != surl:
-            _run_bpcs(["rm", cloud_dir], timeout=30)
+        blocked = self._check_switch_allowed(surl)
+        if blocked:
+            yield event.plain_result(f"❌ {blocked}")
+            return
 
         yield event.plain_result("⏳ 正在转存并获取目录结构...")
-        result = await asyncio.to_thread(list_share_content, surl, pwd)
+        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
         if "error" in result:
             yield event.plain_result(f"❌ {result['error']}")
         else:
-            self._cached_surl = surl
-            self._cached_pwd = pwd
-            self._cached_tree = result["text"]
-            self._cached_items = result.get("items", [])
             yield event.plain_result(result["text"])
