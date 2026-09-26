@@ -4,7 +4,7 @@ author: linker9527
 author_url: https://github.com/linker9527
 description: 百度网盘分享自动下载发送插件。核心优势：共享会员——一个百度账号登录，全群成员共享高速下载，人人无需开通会员。主推扫码登录（无需密码，不怕风控），不收集、不存储、不传输任何账号密码，源码完全开源可审计。支持 napcat/SnowLuma/QQ官方机器人等多平台
 short_desc: 共享会员：一个账号全群免会员下载，主推扫码登录不盗号
-version: 1.8.0
+version: 1.8.1
 repo: https://github.com/linker9527/astrbot_plugin_baidu_pan
 category: 工具
 tags:
@@ -18,7 +18,8 @@ help: |
   首次使用请先执行 /pan download 下载 BaiduPCS-Go 工具
 
   命令:
-  /pan <链接或surl> [提取码] - 转存并查看分享目录树
+  /pan <链接或surl> [提取码] - 查看分享目录树
+  /pan ls [链接] [提取码] - 查看分享目录树（不下载文件，无参数重看缓存）
   /pan look - 重新查看最近一次的目录树
   /pan dir <文件夹路径> - 下载文件夹
   /pan file <文件路径> - 下载指定文件

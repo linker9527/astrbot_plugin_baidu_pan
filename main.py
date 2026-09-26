@@ -1060,7 +1060,7 @@ def _get_local_file_size(file_name: str) -> int:
     "astrbot_plugin_baidu_pan",
     "linker9527",
     "百度网盘分享文件自动下载发送",
-    "1.8.0",
+    "1.8.1",
     "https://github.com/linker9527/astrbot_plugin_baidu_pan",
 )
 class BaiduPanPlugin(Star):
@@ -1569,7 +1569,8 @@ class BaiduPanPlugin(Star):
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
             yield event.plain_result("用法:")
-            yield event.plain_result("/pan <链接> [密码]  转存并查看目录树")
+            yield event.plain_result("/pan <链接> [密码]  查看目录树")
+            yield event.plain_result("/pan ls [链接] [密码]  查看目录树（不下载文件，无参数重看缓存）")
             yield event.plain_result("/pan look  重新查看目录树")
             yield event.plain_result("/pan dir <文件夹路径>  下载文件夹")
             yield event.plain_result("/pan file <文件路径>  下载指定文件")
@@ -1622,6 +1623,31 @@ class BaiduPanPlugin(Star):
                 yield event.plain_result(self._cached_tree)
             else:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
+            return
+
+        if parts[0] == "ls":
+            # 查看分享目录树（不下载文件）：/pan ls [链接 [提取码]]
+            if len(parts) >= 2:
+                surl, pwd2 = self._normalize_link(" ".join(parts[1:]), "")
+                if not surl:
+                    yield event.plain_result("❌ 无法解析链接")
+                    return
+                blocked = self._check_switch_allowed(surl)
+                if blocked:
+                    yield event.plain_result(f"❌ {blocked}")
+                    return
+                yield event.plain_result("⏳ 正在获取目录结构...")
+                result = await asyncio.to_thread(self._transfer_and_list, surl, pwd2)
+                if "error" in result:
+                    yield event.plain_result(f"❌ {result['error']}")
+                else:
+                    yield event.plain_result(result["text"])
+                return
+            # 无参数：重看缓存的目录树
+            if self._cached_tree:
+                yield event.plain_result(self._cached_tree)
+            else:
+                yield event.plain_result("请先使用 /pan ls <链接> [密码] 查看目录")
             return
 
         if parts[0] == "login":
