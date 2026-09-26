@@ -464,8 +464,18 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
 
     try:
         # Step 1: 访问分享页，获取 bdstoken / share_uk / shareid
-        r = sess.get(share_link, timeout=10,
-                     headers={"Referer": "https://pan.baidu.com/disk/home"})
+        # 分享页较重且百度风控会拖响应，超时放宽到 30s 并重试一次
+        r = None
+        for _attempt in (1, 2):
+            try:
+                r = sess.get(share_link, timeout=30,
+                             headers={"Referer": "https://pan.baidu.com/disk/home"})
+                break
+            except _req.exceptions.RequestException as e:
+                if _attempt == 2:
+                    raise
+                logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
+                time.sleep(1)
         if _grab_share_field(r.text, "loginstate") == "0":
             return {"error": "网盘未登录，请使用 /pan qrlogin 重新登录"}
         bdstoken = _grab_share_field(r.text, "bdstoken")
@@ -488,7 +498,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
             }
             r2 = sess.post(verify_url, data={
                 "pwd": pwd, "vcode": "null", "vcode_str": "null", "bdstoken": bdstoken
-            }, headers=headers, timeout=10)
+            }, headers=headers, timeout=20)
             resp2 = r2.json()
             if resp2.get("errno") != 0:
                 if resp2.get("errno") == -9:
@@ -496,7 +506,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
                 return {"error": f"密码验证失败: {resp2.get('errno')}"}
 
         # Step 3: 重新访问分享页（带 init referer），获取新 bdstoken
-        r3 = sess.get(share_link, timeout=10,
+        r3 = sess.get(share_link, timeout=30,
                       headers={"Referer": f"https://pan.baidu.com/share/init?surl={surl}"})
         bdstoken = _grab_share_field(r3.text, "bdstoken") or bdstoken
 
@@ -507,7 +517,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
             f"?bdstoken={bdstoken}&root=1&web=5&app_id=250528"
             f"&shorturl={short}&channel=chunlei&clienttype=0"
         )
-        r4 = sess.get(list_url, timeout=10, headers={"Referer": share_link})
+        r4 = sess.get(list_url, timeout=30, headers={"Referer": share_link})
         resp4 = r4.json()
         if resp4.get("errno") != 0:
             return {"error": f"获取文件列表失败: {resp4.get('errno')}"}
@@ -531,7 +541,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
         r5 = sess.post(transfer_url, data=transfer_data,
                        headers={"Referer": share_link,
                                 "Content-Type": "application/x-www-form-urlencoded"},
-                       timeout=15)
+                       timeout=30)
         resp5 = r5.json()
         errno = resp5.get("errno", -1)
         if errno == 0:
