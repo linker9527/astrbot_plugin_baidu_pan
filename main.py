@@ -1354,14 +1354,17 @@ class BaiduPanPlugin(Star):
         result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
         if "error" in result:
             return result["error"]
-        return result["text"]
+        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        return (f"{result['text']}\n\n"
+                f"（环境信息：网盘转存目录为 {cloud_dir}，本地下载目录为 {DOWNLOAD_DIR}，"
+                f"后续转存/下载结果都在这两个目录下）")
 
     @filter.llm_tool(name="pan_download_dir")
     async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = ""):
         """下载百度网盘分享中的文件夹或单个文件。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
         folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
         工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
-        下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<名称>/...，回复用户时把实际保存路径一起告诉用户。
+        下载完成后文件保存在本地下载目录（后台配置的 download_dir，未配置则为插件目录 storage/downloads）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
 
         Args:
             folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
@@ -1432,7 +1435,7 @@ class BaiduPanPlugin(Star):
                 share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
                 sent = await self._send_file(event, dl, share_url)
                 if sent:
-                    return f"文件 '{folder_path}' 下载并发送完成"
+                    return f"文件 '{folder_path}' 下载并发送完成，本地路径: {dl['path']}"
                 return f"文件 '{folder_path}' 已下载到 {dl['path']}，但发送失败"
         finally:
             self._active_downloads.discard(dl_key)
@@ -1441,7 +1444,7 @@ class BaiduPanPlugin(Star):
     async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = ""):
         """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。
         注意：需要网盘剩余空间大于分享总大小；特大分享（TB级）会转存失败并返回空间不足提示，此时应引导用户改用 pan_download_dir 挑选需要的文件夹或文件分批下载。
-        下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件名>，回复用户时把实际保存路径一起告诉用户。
+        下载完成后文件保存在本地下载目录（后台配置的 download_dir）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
