@@ -480,6 +480,10 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str) -> dict:
                 break
             except _req.exceptions.RequestException as e:
                 if _attempt == 2:
+                    if isinstance(e, _req.exceptions.ReadTimeout):
+                        # 正常分享页 1s 左右响应；两次都读超时基本是分享已在
+                        # 服务端失效（失效分享百度会挂 ~50s 才返回 500）
+                        return {"error": "分享页无响应（重试仍超时），该分享链接很可能已失效，请让分享者重新分享"}
                     raise
                 logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
                 time.sleep(1)
