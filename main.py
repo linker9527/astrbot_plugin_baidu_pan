@@ -1501,6 +1501,48 @@ class BaiduPanPlugin(Star):
         finally:
             self._active_downloads.discard(dl_key)
 
+    @filter.llm_tool(name="pan_transfer")
+    async def pan_transfer(self, event: AstrMessageEvent, link: str = "", pwd: str = "", path: str = ""):
+        """把百度网盘分享中的文件或文件夹转存到自己的网盘（不下载到本地）。用户说"转存一下"、"存到我的网盘"、"先转存"时调用。
+        path 传 pan_list 目录树中显示的路径则只转存该项（需要网盘剩余空间大于该项大小）；不传 path 则转存分享根目录的全部内容（特大分享会因空间不足失败）。
+        转存结果在网盘的暂存目录（默认 /我的资源/AutoTransfer）下，回复用户时把转存到的网盘路径一起告诉用户。
+
+        Args:
+            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
+            pwd(string): 提取码（可选）
+            path(string): 要转存的文件夹或文件在目录树中的路径（可选，不传则转存全部）
+        """
+        if self._is_blacklisted(event):
+            return "你没有权限使用该功能。"
+
+        surl = ""
+        if link:
+            surl, pwd = self._normalize_link(link, pwd)
+
+        if surl:
+            blocked = self._check_switch_allowed(surl)
+            if blocked:
+                return blocked
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+            if "error" in result:
+                return result["error"]
+        elif not self._cached_surl:
+            return "请先查看目录: /pan <链接> [密码]"
+
+        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        if path:
+            tr = await asyncio.to_thread(self._ensure_transferred_sync, path)
+            if "error" in tr:
+                return tr["error"]
+            return f"✅ 已转存「{path}」到网盘 {cloud_dir}/{tr['name']}"
+        # 未指定 path：转存分享根目录全部内容
+        tr = await asyncio.to_thread(
+            _transfer_via_api, self._cached_surl, self._cached_pwd, cloud_dir)
+        if "error" in tr:
+            return tr["error"]
+        names = "、".join(tr.get("filenames", [])[:10]) or "全部内容"
+        return f"✅ 已转存（{names}）到网盘 {cloud_dir}"
+
     async def _login_flow(self, event: AstrMessageEvent, username: str, password: str):
         """/pan login 子命令：账密登录，全局生效"""
         if not event.is_private_chat():
