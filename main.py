@@ -1333,6 +1333,8 @@ class BaiduPanPlugin(Star):
     @filter.llm_tool(name="pan_list")
     async def pan_list(self, event: AstrMessageEvent, link: str, pwd: str = ""):
         """查看百度网盘分享链接的目录结构。用户说"查一下这个百度网盘链接"、"看看里面有什么文件"时调用。
+        特大分享（TB级）也能正常查看（只读目录，不转存、不占网盘空间）。
+        超大目录树最多展示3层/约300项，超出部分会在末尾提示；下载更深层的内容时把已知路径传给下载工具即可。
 
         Args:
             link(string): 百度网盘分享链接，如 https://pan.baidu.com/s/1abc123
@@ -1356,10 +1358,13 @@ class BaiduPanPlugin(Star):
 
     @filter.llm_tool(name="pan_download_dir")
     async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = ""):
-        """下载百度网盘分享中的文件夹（含所有内容）。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"时调用。如果之前已查看过目录树，LLM应从树中找到完整路径。下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件夹名>/...，回复用户时把实际保存路径一起告诉用户。
+        """下载百度网盘分享中的文件夹或单个文件。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
+        folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
+        工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
+        下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<名称>/...，回复用户时把实际保存路径一起告诉用户。
 
         Args:
-            folder_path(string): 文件夹路径，如 "大气层包" 或 "大气层包/子文件夹"，不含顶层目录名
+            folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
             pwd(string): 提取码（可选）
         """
@@ -1434,7 +1439,9 @@ class BaiduPanPlugin(Star):
 
     @filter.llm_tool(name="pan_download_all")
     async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = ""):
-        """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件名>（如 E:\\downloads\\620186943_hitomi999\\xxx.zip），回复用户时把实际保存路径一起告诉用户。
+        """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。
+        注意：需要网盘剩余空间大于分享总大小；特大分享（TB级）会转存失败并返回空间不足提示，此时应引导用户改用 pan_download_dir 挑选需要的文件夹或文件分批下载。
+        下载完成后，文件保存在本地目录：{DOWNLOAD_DIR}/<账号uid_用户名>/<文件名>，回复用户时把实际保存路径一起告诉用户。
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
