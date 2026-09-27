@@ -1067,7 +1067,7 @@ def _get_local_file_size(file_name: str) -> int:
     "astrbot_plugin_baidu_pan",
     "linker9527",
     "百度网盘分享文件自动下载发送",
-    "1.8.1",
+    "1.8.2",
     "https://github.com/linker9527/astrbot_plugin_baidu_pan",
 )
 class BaiduPanPlugin(Star):
@@ -1210,17 +1210,33 @@ class BaiduPanPlugin(Star):
     @staticmethod
     def _normalize_link(link: str, pwd: str) -> tuple:
         """把用户输入的链接/surl 规范化为 (surl, pwd)。支持：
-        完整链接(含?pwd=)、裸surl、裸surl + 提取码(空格分隔或"提取码:"前缀)。"""
+        完整链接(含?pwd=)、链接+空格提取码、裸surl、裸surl + 提取码(空格分隔或"提取码:"前缀)。"""
         link = (link or "").strip()
         if link.startswith(("http", "pan.baidu.com", "yun.baidu.com")):
             if not link.startswith("http"):
                 link = "https://" + link
+            # 链接后可能跟了空格分隔的提取码（命令参数拼接，如"链接 052x"/"链接 提取码:052x"）
+            seg = link.split(None, 1)
+            if len(seg) > 1:
+                m = re.search(
+                    r'(?:(?:pwd|password|提取码)\s*[:：=]?\s*)?([A-Za-z0-9]{4,6})\s*$',
+                    seg[1].strip(), re.IGNORECASE)
+                if m and not pwd:
+                    pwd = m.group(1)
+                link = seg[0]
             surl, p2 = parse_share_link(link)
             return surl, (p2 or pwd)
         # 裸 surl：取第一段，剩余部分尝试提取密码
         seg = link.split(None, 1)
         surl = seg[0]
         rest = seg[1].strip() if len(seg) > 1 else ""
+        if "?" in surl:  # 裸 surl 带查询串，如 1abc?pwd=052x
+            surl, query = surl.split("?", 1)
+            if not pwd:
+                m2 = re.search(r'(?:^|[&\s])(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})',
+                               query, re.IGNORECASE)
+                if m2:
+                    pwd = m2.group(1)
         if not pwd and rest:
             m = re.search(r'(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})', rest, re.IGNORECASE)
             if m:
