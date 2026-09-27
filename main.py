@@ -809,7 +809,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     lines, items = [], []
     state = {"truncated": False}
 
-    def _walk(dir_rel: str, depth: int):
+    def _walk(dir_rel: str, api_dir: str, depth: int):
         if len(items) > 300:
             state["truncated"] = True
             return
@@ -817,15 +817,22 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
             return
         params = {"bdstoken": bdstoken, "web": "5", "app_id": "250528",
                   "shorturl": short, "channel": "chunlei", "clienttype": "0", "num": "100"}
-        if dir_rel:
-            params["dir"] = "/" + dir_rel
+        if api_dir:
+            # 子目录必须用父列表返回的原始 path：分享可能创建自网盘子目录，
+            # 内部路径并不以分享内容名开头（如 /模拟器/NS/Citron-neo）
+            params["dir"] = api_dir
             params["root"] = "0"
         else:
             params["root"] = "1"
         try:
             r = sess.get("https://pan.baidu.com/share/list", params=params,
                          headers={"Referer": share_link}, timeout=30)
-            lst = r.json().get("list", [])
+            j = r.json()
+            lst = j.get("list") or []
+            if j.get("errno") != 0 and dir_rel:
+                lines.append(f"{'  ' * depth}⚠️ 子目录 {dir_rel} 获取失败(errno={j.get('errno')})")
+                logger.warning(f"[BaiduPan] share/list {dir_rel} errno={j.get('errno')}")
+                return
         except Exception as e:
             logger.warning(f"[BaiduPan] share/list {dir_rel or '根目录'} 失败: {e}")
             return
@@ -840,13 +847,13 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
                 lines.append(f"{prefix}📁 {name}/")
                 items.append({"path": rel, "name": name, "size": "-", "is_dir": True,
                               "fs_id": str(f.get("fs_id"))})
-                _walk(rel, depth + 1)
+                _walk(rel, f.get("path") or "", depth + 1)
             else:
                 lines.append(f"{prefix}📄 {name}  ({_format_size(str(f.get('size', 0)))})")
                 items.append({"path": rel, "name": name, "size": str(f.get("size", 0)),
                               "is_dir": False, "fs_id": str(f.get("fs_id"))})
 
-    _walk("", 0)
+    _walk("", "", 0)
     if not lines:
         return {"error": "目录为空或获取失败"}
     if state["truncated"]:
