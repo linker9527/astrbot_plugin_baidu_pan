@@ -1067,7 +1067,7 @@ def _get_local_file_size(file_name: str) -> int:
     "astrbot_plugin_baidu_pan",
     "linker9527",
     "百度网盘分享文件自动下载发送",
-    "1.8.2",
+    "1.8.3",
     "https://github.com/linker9527/astrbot_plugin_baidu_pan",
 )
 class BaiduPanPlugin(Star):
@@ -2021,7 +2021,7 @@ class BaiduPanPlugin(Star):
                     self._active_downloads.discard(dl_key)
             return
 
-        # 默认: /pan <链接> [密码] → 转存并展示目录树（整串交给 _normalize_link 统一解析）
+        # 默认: /pan <链接> [密码] → 查看目录树（整串交给 _normalize_link 统一解析）
         surl, pwd = self._normalize_link(" ".join(parts), "")
 
         if not surl:
@@ -2033,7 +2033,7 @@ class BaiduPanPlugin(Star):
             yield event.plain_result(f"❌ {blocked}")
             return
 
-        yield event.plain_result("⏳ 正在转存并获取目录结构...")
+        yield event.plain_result("⏳ 正在获取目录结构...")
         result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
         if "error" in result:
             yield event.plain_result(f"❌ {result['error']}")
